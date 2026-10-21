@@ -1,6 +1,8 @@
 const express = require('express');
 const { getUserContext } = require('../middlewares/getUserContext.middleware');
 const {
+     getQuote,
+     getSeatQuote,
      createBooking,
      getBooking,
      getUserBookings,
@@ -11,6 +13,8 @@ const {
 const router = express.Router();
 
 // All booking routes require authentication (user context from gateway)
+router.get('/bookings/quote', getUserContext, getQuote);
+router.get('/bookings/seat-quote', getUserContext, getSeatQuote);
 router.post('/bookings', getUserContext, createBooking);
 router.get('/bookings', getUserContext, getUserBookings);
 router.get('/bookings/:bookingId', getUserContext, getBooking);

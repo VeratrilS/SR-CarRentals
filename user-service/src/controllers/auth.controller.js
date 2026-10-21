@@ -2,7 +2,7 @@ const { BadRequestError, UnauthorizedError } = require("../utils/error");
 const asyncHandler = require('../utils/asyncHandler');
 const {config} = require('../config');
 const authService = require('../services/auth.service');
-const getDeviceFingerprint = require("../utils/deviceFingerPrint");
+const getDeviceFingerprint = require("../utils/deviceFingerprint");
 
 const isProd = process.env.NODE_ENV === 'production';
 
@@ -79,6 +79,15 @@ exports.rotateRefreshToken = asyncHandler(async(req, res) =>{
      })
 })
 
+
+exports.logout = asyncHandler(async(req, res) =>{
+     const deviceId = getDeviceFingerprint(req);
+     await authService.logout(req.cookies.refreshToken, deviceId);
+     const clear = { httpOnly: true, secure: isProd, sameSite: isProd ? 'strict' : 'lax' };
+     res.clearCookie("accessToken", clear);
+     res.clearCookie("refreshToken", clear);
+     res.status(200).json({ success: true, message: "Logged out" });
+})
 
 exports.verifyGoogleIdToken = asyncHandler(async(req, res) =>{
      const {idToken} = req.body;

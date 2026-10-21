@@ -9,6 +9,7 @@ const config = {
      ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
 
      INTERNAL_SERVICE_KEY: process.env.INTERNAL_SERVICE_KEY,
+     INVENTORY_SERVICE_URL: process.env.INVENTORY_SERVICE_URL || 'http://localhost:4007',
 }
 
 module.exports = {config};

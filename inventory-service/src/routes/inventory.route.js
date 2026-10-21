@@ -1,38 +1,37 @@
 const express = require('express');
-const { getUserContext } = require('../middlewares/getUserContext.middleware');
 const { internalAuth } = require('../middlewares/internalAuth.middleware');
-const { config } = require('../config');
 const {
-     getScheduleAvailability,
-     getScheduleSeats,
-     lockSeats,
-     unlockSeats,
-     confirmSeats,
+     getCarAvailability,
+     lockCar,
+     releaseCar,
+     confirmCar,
      cancelBooking,
 } = require('../controllers/inventory.controller');
+const trip = require('../controllers/trip.controller');
 
 const router = express.Router();
 
-// Allows either user context (from gateway) or internal service key (from booking-service)
-function userOrInternal(req, res, next) {
-     const serviceKey = req.headers['x-internal-service-key'];
-     if (serviceKey && serviceKey === config.INTERNAL_SERVICE_KEY) {
-          req.user = { id: 'internal-service' };
-          return next();
-     }
-     return getUserContext(req, res, next);
-}
-
-// Public: aggregate availability (used by search results)
-router.get('/schedules/:scheduleId/availability', getScheduleAvailability);
-
-// Authenticated OR internal: individual seat statuses
-router.get('/schedules/:scheduleId/seats', userOrInternal, getScheduleSeats);
+// Public: a car's blocked ranges, and whether a requested window is free
+router.get('/cars/:carId/availability', getCarAvailability);
 
 // Internal: called by booking-service (protected by service key)
-router.post('/seats/lock', internalAuth, lockSeats);
-router.post('/seats/unlock', internalAuth, unlockSeats);
-router.post('/seats/confirm', internalAuth, confirmSeats);
-router.post('/seats/cancel-booking', internalAuth, cancelBooking);
+router.post('/holds/lock', internalAuth, lockCar);
+router.post('/holds/release', internalAuth, releaseCar);
+router.post('/holds/confirm', internalAuth, confirmCar);
+router.post('/holds/cancel-booking', internalAuth, cancelBooking);
+
+// --- Shared rides ---
+// Public: seat map for a trip (optionally for a stretch ?fromSeq=&toSeq=)
+router.get('/trips/:tripId/seats', trip.getSeatMap);
+
+// Internal
+router.get('/internal/trips/:tripId', internalAuth, trip.getTripInternal);
+router.post('/internal/trips/availability', internalAuth, trip.availabilityBatch);
+router.post('/trip-holds/lock', internalAuth, trip.lockSeats);
+router.post('/trip-holds/release', internalAuth, trip.releaseSeats);
+router.post('/trip-holds/confirm', internalAuth, trip.confirmSeats);
+router.post('/trip-holds/cancel-booking', internalAuth, trip.cancelSeatBooking);
+router.post('/internal/cars/reserve', internalAuth, trip.reserveCar);
+router.post('/internal/cars/release-reservation', internalAuth, trip.releaseCarReservation);
 
 module.exports = router;

@@ -8,7 +8,7 @@ datasource db {
 
 enum BookingStatus {
   PENDING
-  SEATS_HELD
+  CAR_HELD
   PAYMENT_PENDING
   CONFIRMING
   CONFIRMED
@@ -19,10 +19,17 @@ enum BookingStatus {
 }
 
 enum SagaStep {
+  HOLD_CAR
   HOLD_SEATS
   CREATE_PAYMENT
+  CONFIRM_CAR
   CONFIRM_SEATS
   COMPLETE
+}
+
+enum BookingType {
+  RENTAL // whole car, self-drive, for a time window
+  SEAT // seats on a shared-ride trip, for a stretch of its route
 }
 
 enum SagaStepStatus {
@@ -34,66 +41,61 @@ enum SagaStepStatus {
 }
 
 model Booking {
-  id             String        @id @default(uuid())
-  userId         String
-  scheduleId     String
-  trainId        String
-  trainNumber    String
-  trainName      String
-  departureDate  DateTime      @db.Date
-  status         BookingStatus @default(PENDING)
-  totalAmount    Float         @default(0)
-  seatCount      Int
-  fromStationId  String?       // --- SEGMENT BOOKING: boarding station ID
-  toStationId    String?       // --- SEGMENT BOOKING: alighting station ID
-  fromSeq        Int?          // --- SEGMENT BOOKING: sequence number of boarding station
-  toSeq          Int?          // --- SEGMENT BOOKING: sequence number of alighting station
-  idempotencyKey String        @unique
-  paymentOrderId String?       @unique
+  id                 String        @id @default(uuid())
+  type               BookingType   @default(RENTAL)
+  userId             String
+  carId              String
+  registrationNumber String
+  carName            String // "Hyundai Creta"
+  category           String
+  branchId           String
+  branchName         String
+  city               String
+  pickupAt           DateTime
+  dropoffAt          DateTime
+  status             BookingStatus @default(PENDING)
+
+  // Pricing snapshot (rates can change after booking)
+  rentalDays     Int? // RENTAL only
+  dailyRate      Float? // RENTAL only
+  baseAmount     Float
+  discountAmount Float @default(0)
+  totalAmount    Float
+  refundAmount   Float @default(0)
+
+  // Primary driver (RENTAL only)
+  driverName          String?
+  driverAge           Int?
+  driverLicenseNumber String?
+  driverPhone         String?
+
+  // Shared ride (SEAT only): seats on trip `tripId` for stops [fromSeq, toSeq)
+  tripId       String?
+  routeName    String?
+  fromSeq      Int?
+  toSeq        Int?
+  fromStopName String?
+  toStopName   String?
+  seatNumbers  Int[]   @default([])
+  seatFare     Float? // per seat
+  passengers   Json? // [{ name, age, gender, seatNumber }]
+
+  idempotencyKey String    @unique
+  paymentOrderId String?   @unique
   lockExpiresAt  DateTime?
   failureReason  String?
-  version        Int           @default(0)
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
+  version        Int       @default(0)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  seats      BookingSeat[]
-  passengers Passenger[]
-  sagaLog    SagaLog[]
+  sagaLog SagaLog[]
 
   @@index([userId])
-  @@index([scheduleId])
+  @@index([carId])
+  @@index([tripId])
   @@index([status])
   @@index([lockExpiresAt, status])
   @@map("bookings")
-}
-
-model BookingSeat {
-  id         String   @id @default(uuid())
-  bookingId  String
-  seatId     String
-  seatNumber Int
-  seatType   String
-  price      Float
-  createdAt  DateTime @default(now())
-
-  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-
-  @@unique([bookingId, seatId])
-  @@map("booking_seats")
-}
-
-model Passenger {
-  id        String   @id @default(uuid())
-  bookingId String
-  name      String
-  age       Int
-  gender    String
-  seatId    String?
-  createdAt DateTime @default(now())
-
-  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-
-  @@map("passengers")
 }
 
 model SagaLog {

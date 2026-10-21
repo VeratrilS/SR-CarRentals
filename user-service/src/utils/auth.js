@@ -8,9 +8,19 @@ exports.hashToken = (refreshToken) => {
      return crypto.createHash('sha256').update(refreshToken).digest('hex');
 }
 
-exports.generateAccessToken = (userId) => {
+/**
+ * Role-based access: emails listed in ADMIN_EMAILS are fleet admins.
+ * The role travels inside the access token so the gateway can authorise
+ * /admins/* routes without calling back into user-service.
+ */
+exports.roleFor = (email) => {
+     return email && config.ADMIN_EMAILS.includes(email.toLowerCase()) ? 'ADMIN' : 'USER';
+}
+
+exports.generateAccessToken = (userId, role = 'USER') => {
      const payload = {
-          id: userId
+          id: userId,
+          role
      }
      return jwt.sign(payload, config.JWT_ACCESS_SECRET, { expiresIn: config.ACCESS_TOKEN_EXP })
 }

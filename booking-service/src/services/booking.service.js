@@ -1,14 +1,17 @@
 const prisma = require('../config/prisma');
 const logger = require('../config/logger');
 const { config } = require('../config');
-const { inventoryClient, extractError: extractInventoryError } = require('./inventoryClient');
-const { paymentClient, extractError: extractPaymentError } = require('./paymentClient');
+const { inventoryClient } = require('./inventoryClient');
+const { paymentClient } = require('./paymentClient');
 const { userClient } = require('./userClient');
-const { stationClient } = require('./stationClient');
-const { acquireSeatLocks, releaseSeatLocks, forceReleaseSeatLocks } = require('../utils/distributedLock');
+const { acquireCarLock, releaseCarLock, forceReleaseBookingLock, acquireKeys, releaseKeys, tripSeatLockKeys } = require('../utils/distributedLock');
+const { calculatePrice, validateRentalWindow, minDriverAge, calculateRefund, calculateSeatFare } = require('../utils/pricing');
+const holds = require('./holds');
 const saga = require('./saga.service');
 const bookingProducer = require('../kafka/producer/booking.producer');
 const { BadRequestError, NotFoundError, ConflictError, StaleStateError } = require('../utils/error');
+
+const ACTIVE_STATUSES = ['PENDING', 'CAR_HELD', 'PAYMENT_PENDING', 'CONFIRMED'];
 
 // ─── Optimistic Lock Helper (CAS — Compare-And-Swap) ────────────────────────
 // Atomically updates booking status ONLY IF the version hasn't changed since read.
@@ -27,9 +30,9 @@ const casUpdateBooking = async (bookingId, expectedVersion, data) => {
      }
 };
 
-// ─── Notification Enrichment Helpers ─────────────────────────────────────────
-// Looks up user (and optionally stations) so booking events can carry email/firstName
-// directly. Failures here must never break the booking workflow — log and return null.
+// ─── Notification Helpers ────────────────────────────────────────────────────
+// Looks up the user so booking events can carry email/firstName directly.
+// Failures here must never break the booking workflow — log and return {}.
 
 const fetchUserForNotification = async (userId) => {
      try {
@@ -44,19 +47,35 @@ const fetchUserForNotification = async (userId) => {
      }
 };
 
-const fetchStationName = async (stationId) => {
-     if (!stationId) return null;
-     try {
-          const station = await stationClient.getStationById(stationId);
-          return station ? station.name : null;
-     } catch (err) {
-          logger.warn('Failed to enrich booking event with station name', {
-               stationId,
-               error: err.message,
-          });
-          return null;
-     }
-};
+const toEventPayload = (booking, userInfo) => ({
+     bookingId: booking.id,
+     type: booking.type,
+     userId: booking.userId,
+     email: userInfo.email,
+     firstName: userInfo.firstName,
+     carId: booking.carId,
+     carName: booking.carName,
+     registrationNumber: booking.registrationNumber,
+     category: booking.category,
+     branchName: booking.branchName,
+     city: booking.city,
+     pickupAt: booking.pickupAt,
+     dropoffAt: booking.dropoffAt,
+     rentalDays: booking.rentalDays,
+     dailyRate: booking.dailyRate,
+     baseAmount: booking.baseAmount,
+     discountAmount: booking.discountAmount,
+     totalAmount: booking.totalAmount,
+     driverName: booking.driverName,
+     // shared rides
+     tripId: booking.tripId,
+     routeName: booking.routeName,
+     fromStopName: booking.fromStopName,
+     toStopName: booking.toStopName,
+     seatNumbers: booking.seatNumbers,
+     seatFare: booking.seatFare,
+     passengers: booking.passengers,
+});
 
 // ─── Idempotency Helper ──────────────────────────────────────────────────────
 
@@ -75,161 +94,149 @@ const saveIdempotency = async (key, response) => {
      });
 };
 
+// ─── Validation ──────────────────────────────────────────────────────────────
+
+const validateDriver = (driver, category) => {
+     if (!driver || typeof driver !== 'object') {
+          throw new BadRequestError('driver details are required');
+     }
+     const { name, age, licenseNumber, phone } = driver;
+     if (!name || !age || !licenseNumber || !phone) {
+          throw new BadRequestError('driver.name, driver.age, driver.licenseNumber and driver.phone are required');
+     }
+     const minAge = minDriverAge(category);
+     if (!Number.isInteger(Number(age)) || Number(age) < minAge || Number(age) > 80) {
+          throw new BadRequestError(`Driver must be between ${minAge} and 80 years old for a ${category} car`);
+     }
+     if (!/^[A-Z0-9-]{8,20}$/i.test(String(licenseNumber).replace(/\s+/g, ''))) {
+          throw new BadRequestError('driver.licenseNumber looks invalid');
+     }
+     if (!/^\+?[0-9]{10,13}$/.test(String(phone).replace(/[\s-]+/g, ''))) {
+          throw new BadRequestError('driver.phone must be a valid 10–13 digit number');
+     }
+};
+
+// ─── Quote (price preview, no side effects) ─────────────────────────────────
+
+const getQuote = async (carId, pickupAtRaw, dropoffAtRaw) => {
+     const pickupAt = new Date(pickupAtRaw);
+     const dropoffAt = new Date(dropoffAtRaw);
+
+     const windowError = validateRentalWindow(pickupAt, dropoffAt);
+     if (windowError) throw new BadRequestError(windowError);
+
+     const availability = await inventoryClient.getAvailability(carId, pickupAt, dropoffAt);
+
+     return {
+          carId,
+          carName: `${availability.make} ${availability.model}`,
+          category: availability.category,
+          branchName: availability.branchName,
+          city: availability.city,
+          pickupAt,
+          dropoffAt,
+          available: availability.requested?.available ?? false,
+          minDriverAge: minDriverAge(availability.category),
+          ...calculatePrice(availability.dailyRate, pickupAt, dropoffAt),
+     };
+};
+
 // ─── Create Booking ──────────────────────────────────────────────────────────
 
-// --- SEGMENT BOOKING: Added fromStationId, toStationId, fromSeq, toSeq params ---
-const createBooking = async (userId, scheduleId, seatIds, passengers, idempotencyKey, fromStationId, toStationId, fromSeq, toSeq) => {
+const createBooking = async (userId, carId, pickupAtRaw, dropoffAtRaw, driver, idempotencyKey) => {
      // 1. Validate input
-     if (!scheduleId || !seatIds || !Array.isArray(seatIds) || seatIds.length === 0) {
-          throw new BadRequestError('scheduleId and seatIds (non-empty array) are required');
-     }
-     if (!passengers || !Array.isArray(passengers) || passengers.length === 0) {
-          throw new BadRequestError('passengers (non-empty array) is required');
-     }
-     if (seatIds.length !== passengers.length) {
-          throw new BadRequestError('Number of seats must match number of passengers');
+     if (!carId || !pickupAtRaw || !dropoffAtRaw) {
+          throw new BadRequestError('carId, pickupAt and dropoffAt are required');
      }
      if (!idempotencyKey) {
           throw new BadRequestError('idempotencyKey is required');
      }
 
-     // --- SEGMENT BOOKING: Validate segment params if provided ---
-     if (fromSeq && toSeq && fromSeq >= toSeq) {
-          throw new BadRequestError('fromStation must come before toStation in route');
-     }
+     const pickupAt = new Date(pickupAtRaw);
+     const dropoffAt = new Date(dropoffAtRaw);
+     const windowError = validateRentalWindow(pickupAt, dropoffAt);
+     if (windowError) throw new BadRequestError(windowError);
 
      // 2. Check idempotency
      const cached = await checkIdempotency(`booking:${idempotencyKey}`);
      if (cached) return cached;
 
-     // 3. Fetch schedule availability and seat details from inventory
-     const availability = await inventoryClient.getAvailability(scheduleId);
-     if (availability.status !== 'ACTIVE') {
-          throw new BadRequestError('Schedule is not active');
+     // 3. Fetch the car and check the window is free (fast fail — inventory re-checks under lock)
+     const car = await inventoryClient.getAvailability(carId, pickupAt, dropoffAt);
+     if (car.status !== 'ACTIVE') {
+          throw new BadRequestError('This car is not available for rent right now');
+     }
+     if (!car.requested?.available) {
+          throw new ConflictError('This car is already reserved for part of the selected period', 'CAR_UNAVAILABLE');
      }
 
-     // Prevent booking trains that have already departed
-     if (new Date(availability.departureDate) < new Date()) {
-          throw new BadRequestError('Cannot book a train that has already departed');
-     }
+     validateDriver(driver, car.category);
+     const price = calculatePrice(car.dailyRate, pickupAt, dropoffAt);
 
-     // --- SEGMENT BOOKING: Pass segment params to get segment-aware seat availability ---
-     const seatData = await inventoryClient.getSeats(scheduleId, {
-          fromSeq: fromSeq || undefined,
-          toSeq: toSeq || undefined,
-     });
-     const seatMap = new Map(seatData.seats.map(s => [s.seatId, s]));
-
-     // Verify all requested seats exist and are available
-     const bookingSeats = [];
-     let totalAmount = 0;
-     for (const seatId of seatIds) {
-          const seat = seatMap.get(seatId);
-          if (!seat) {
-               throw new NotFoundError(`Seat ${seatId} not found in schedule`);
-          }
-          // --- SEGMENT BOOKING: Use segmentStatus when available for segment-aware validation ---
-          const isAvailable = (fromSeq && toSeq && seat.segmentStatus !== undefined)
-               ? seat.segmentStatus === 'AVAILABLE'
-               : seat.status === 'AVAILABLE';
-          if (!isAvailable) {
-               throw new ConflictError(`Seat #${seat.seatNumber} is not available for this segment`, 'SEATS_UNAVAILABLE');
-          }
-          bookingSeats.push(seat);
-          totalAmount += seat.price;
-     }
-
-     // 4. Sort seatIds (deadlock prevention for distributed locks)
-     const sortedSeatIds = [...seatIds].sort();
-
-     // 5. Acquire Redis distributed locks (segment-aware keys for segment bookings)
-     const { acquired, lockValue } = await acquireSeatLocks(
-          scheduleId,
-          sortedSeatIds,
-          `pre-${Date.now()}`, // temporary ID before booking is created
-          config.BOOKING_TTL_SECONDS,
-          fromSeq,  // --- SEGMENT BOOKING: include in lock key
-          toSeq     // --- SEGMENT BOOKING: include in lock key
+     // 4. Acquire Redis distributed lock for this car + window
+     const { acquired, lockValue } = await acquireCarLock(
+          carId,
+          pickupAt,
+          dropoffAt,
+          `pre-${Date.now()}`, // temporary owner before booking is created
+          config.BOOKING_TTL_SECONDS
      );
 
      if (!acquired) {
           throw new ConflictError(
-               'One or more seats are being booked by another user. Please try again.',
-               'SEATS_LOCKED'
+               'Someone else is booking this car for the same dates. Please try again.',
+               'CAR_LOCKED'
           );
      }
 
      let booking;
      try {
-          // 6. Create booking record in DB
+          // 5. Create booking record in DB
           const lockExpiresAt = new Date(Date.now() + config.BOOKING_TTL_SECONDS * 1000);
 
           booking = await prisma.booking.create({
                data: {
                     userId,
-                    scheduleId,
-                    trainId: availability.trainId,
-                    trainNumber: availability.trainNumber,
-                    trainName: availability.trainName,
-                    departureDate: new Date(availability.departureDate),
+                    carId,
+                    registrationNumber: car.registrationNumber,
+                    carName: `${car.make} ${car.model}`,
+                    category: car.category,
+                    branchId: car.branchId,
+                    branchName: car.branchName,
+                    city: car.city,
+                    pickupAt,
+                    dropoffAt,
                     status: 'PENDING',
-                    totalAmount,
-                    seatCount: seatIds.length,
-                    fromStationId: fromStationId || null,  // --- SEGMENT BOOKING
-                    toStationId: toStationId || null,      // --- SEGMENT BOOKING
-                    fromSeq: fromSeq || null,              // --- SEGMENT BOOKING
-                    toSeq: toSeq || null,                  // --- SEGMENT BOOKING
+                    ...price,
+                    driverName: driver.name.trim(),
+                    driverAge: Number(driver.age),
+                    driverLicenseNumber: String(driver.licenseNumber).replace(/\s+/g, '').toUpperCase(),
+                    driverPhone: String(driver.phone).replace(/[\s-]+/g, ''),
                     idempotencyKey,
                     lockExpiresAt,
-                    seats: {
-                         create: bookingSeats.map((seat, index) => ({
-                              seatId: seat.seatId,
-                              seatNumber: seat.seatNumber,
-                              seatType: seat.seatType,
-                              price: seat.price,
-                         })),
-                    },
-                    passengers: {
-                         create: passengers.map((p, index) => ({
-                              name: p.name,
-                              age: p.age,
-                              gender: p.gender,
-                              seatId: seatIds[index] || null, // use original order to match user's intended seat assignment
-                         })),
-                    },
                },
-               include: { seats: true, passengers: true },
           });
 
-          // 7. Execute saga Step 1: Hold seats in inventory
-          await saga.executeHoldSeats(booking, sortedSeatIds, config.LOCK_TTL_SECONDS, fromSeq, toSeq); // --- SEGMENT BOOKING
+          // 6. Saga Step 1: hold the car in inventory
+          await saga.executeHold(booking, config.LOCK_TTL_SECONDS);
 
-          // 8. Execute saga Step 2: Create payment order
+          // 7. Saga Step 2: create payment order
           const paymentOrder = await saga.executeCreatePayment(booking);
 
-          // Refresh booking after updates
-          booking = await prisma.booking.findUnique({
-               where: { id: booking.id },
-               include: { seats: true, passengers: true },
-          });
+          booking = await prisma.booking.findUnique({ where: { id: booking.id } });
 
-          // 9. Save idempotency
+          // 8. Save idempotency
           const response = {
                bookingId: booking.id,
                status: booking.status,
+               carName: booking.carName,
+               pickupAt: booking.pickupAt,
+               dropoffAt: booking.dropoffAt,
+               rentalDays: booking.rentalDays,
+               baseAmount: booking.baseAmount,
+               discountAmount: booking.discountAmount,
                totalAmount: booking.totalAmount,
                lockExpiresAt: booking.lockExpiresAt,
-               seats: booking.seats.map(s => ({
-                    seatId: s.seatId,
-                    seatNumber: s.seatNumber,
-                    seatType: s.seatType,
-                    price: s.price,
-               })),
-               passengers: booking.passengers.map(p => ({
-                    name: p.name,
-                    age: p.age,
-                    gender: p.gender,
-               })),
                paymentOrder: {
                     paymentOrderId: paymentOrder.paymentOrderId,
                     gatewayOrderId: paymentOrder.gatewayOrderId,
@@ -248,7 +255,7 @@ const createBooking = async (userId, scheduleId, seatIds, passengers, idempotenc
           logger.error(`Booking creation failed for user ${userId}`, { error: error.message });
 
           if (booking) {
-               await saga.compensateAll(booking, sortedSeatIds);
+               await saga.compensateAll(booking);
                await prisma.booking.update({
                     where: { id: booking.id },
                     data: {
@@ -258,8 +265,7 @@ const createBooking = async (userId, scheduleId, seatIds, passengers, idempotenc
                });
           }
 
-          // Release Redis locks (segment-aware)
-          await releaseSeatLocks(scheduleId, sortedSeatIds, lockValue, fromSeq, toSeq);
+          await releaseCarLock(carId, pickupAt, dropoffAt, lockValue);
 
           throw error;
      }
@@ -267,11 +273,8 @@ const createBooking = async (userId, scheduleId, seatIds, passengers, idempotenc
 
 // ─── Handle Payment Success (Kafka consumer) ─────────────────────────────────
 
-const handlePaymentSuccess = async (paymentOrderId, gatewayPaymentId, amount) => {
-     const booking = await prisma.booking.findUnique({
-          where: { paymentOrderId },
-          include: { seats: true, passengers: true },
-     });
+const handlePaymentSuccess = async (paymentOrderId) => {
+     const booking = await prisma.booking.findUnique({ where: { paymentOrderId } });
 
      if (!booking) {
           logger.warn(`No booking found for paymentOrderId: ${paymentOrderId}`);
@@ -284,62 +287,49 @@ const handlePaymentSuccess = async (paymentOrderId, gatewayPaymentId, amount) =>
           return;
      }
 
+     // Payment landed after the booking expired / was cancelled — the customer was
+     // charged for a car they no longer hold, so refund it in full.
+     if (['EXPIRED', 'CANCELLED', 'FAILED'].includes(booking.status)) {
+          logger.warn(`Late payment for ${booking.status} booking ${booking.id} — refunding`);
+          try {
+               await paymentClient.initiateRefund(
+                    paymentOrderId,
+                    booking.totalAmount,
+                    'late_payment',
+                    `${booking.id}-late-payment-refund`
+               );
+          } catch (err) {
+               logger.error(`Failed to refund late payment for booking ${booking.id}`, { error: err.message });
+               throw err; // let the consumer retry / DLQ — money must not be kept silently
+          }
+          return;
+     }
+
      if (booking.status !== 'PAYMENT_PENDING') {
           logger.warn(`Booking ${booking.id} in unexpected status: ${booking.status}`);
           return;
      }
 
-     const seatIds = booking.seats.map(s => s.seatId).sort();
-
      try {
           // Atomically claim this booking — if expiry job or cancel already changed it, bail out
           await casUpdateBooking(booking.id, booking.version, { status: 'CONFIRMING' });
 
-          // Execute saga Step 3: Confirm seats in inventory
-          await saga.executeConfirmSeats(booking, seatIds, booking.fromSeq, booking.toSeq); // --- SEGMENT BOOKING
+          // Saga Step 3: confirm the hold in inventory
+          await saga.executeConfirm(booking);
 
-          // Final status update (version was already incremented by CAS above)
           await prisma.booking.updateMany({
                where: { id: booking.id, status: 'CONFIRMING' },
-               data: { status: 'CONFIRMED', version: { increment: 1 } },
+               data: { status: 'CONFIRMED', lockExpiresAt: null, version: { increment: 1 } },
           });
 
-          // Release Redis locks (segment-aware)
-          await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+          await forceReleaseBookingLock(booking);
 
           // Publish BOOKING_CONFIRMED (retried by producer — log but don't fail the booking)
           try {
-               const [userInfo, fromStationName, toStationName] = await Promise.all([
-                    fetchUserForNotification(booking.userId),
-                    fetchStationName(booking.fromStationId),
-                    fetchStationName(booking.toStationId),
-               ]);
-
-               await bookingProducer.publishBookingConfirmed({
-                    bookingId: booking.id,
-                    userId: booking.userId,
-                    email: userInfo.email,
-                    firstName: userInfo.firstName,
-                    scheduleId: booking.scheduleId,
-                    trainNumber: booking.trainNumber,
-                    trainName: booking.trainName,
-                    fromStationName,
-                    toStationName,
-                    departureDate: booking.departureDate,
-                    seats: booking.seats.map(s => ({
-                         seatNumber: s.seatNumber,
-                         seatType: s.seatType,
-                         price: s.price,
-                    })),
-                    passengers: booking.passengers.map(p => ({
-                         name: p.name,
-                         age: p.age,
-                         gender: p.gender,
-                    })),
-                    totalAmount: booking.totalAmount,
-               });
+               const userInfo = await fetchUserForNotification(booking.userId);
+               await bookingProducer.publishBookingConfirmed(toEventPayload(booking, userInfo));
           } catch (err) {
-               logger.error('CRITICAL: Failed to publish BOOKING_CONFIRMED after retries — notification/search may be stale', {
+               logger.error('CRITICAL: Failed to publish BOOKING_CONFIRMED after retries — notification may be missed', {
                     bookingId: booking.id,
                     error: err.message,
                });
@@ -356,8 +346,8 @@ const handlePaymentSuccess = async (paymentOrderId, gatewayPaymentId, amount) =>
 
           logger.error(`Failed to confirm booking ${booking.id}`, { error: error.message });
 
-          // Compensate: refund payment and release seats
-          await saga.compensateAll(booking, seatIds);
+          // Compensate: refund payment and release the car
+          await saga.compensateAll(booking);
 
           await prisma.booking.updateMany({
                where: { id: booking.id, status: { in: ['PAYMENT_PENDING', 'CONFIRMING'] } },
@@ -368,17 +358,13 @@ const handlePaymentSuccess = async (paymentOrderId, gatewayPaymentId, amount) =>
                },
           });
 
-          await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+          await forceReleaseBookingLock(booking);
 
           try {
                const userInfo = await fetchUserForNotification(booking.userId);
                await bookingProducer.publishBookingFailed({
-                    bookingId: booking.id,
-                    userId: booking.userId,
-                    email: userInfo.email,
-                    firstName: userInfo.firstName,
-                    scheduleId: booking.scheduleId,
-                    reason: 'confirm_seats_failed',
+                    ...toEventPayload(booking, userInfo),
+                    reason: 'confirm_car_failed',
                });
           } catch (err) {
                logger.error('Failed to publish BOOKING_FAILED after retries', { bookingId: booking.id, error: err.message });
@@ -389,10 +375,7 @@ const handlePaymentSuccess = async (paymentOrderId, gatewayPaymentId, amount) =>
 // ─── Handle Payment Failure (Kafka consumer) ─────────────────────────────────
 
 const handlePaymentFailure = async (paymentOrderId, reason) => {
-     const booking = await prisma.booking.findUnique({
-          where: { paymentOrderId },
-          include: { seats: true },
-     });
+     const booking = await prisma.booking.findUnique({ where: { paymentOrderId } });
 
      if (!booking) {
           logger.warn(`No booking found for paymentOrderId: ${paymentOrderId}`);
@@ -400,7 +383,7 @@ const handlePaymentFailure = async (paymentOrderId, reason) => {
      }
 
      // Idempotent
-     if (booking.status === 'FAILED' || booking.status === 'CANCELLED' || booking.status === 'EXPIRED') {
+     if (['FAILED', 'CANCELLED', 'EXPIRED'].includes(booking.status)) {
           logger.info(`Booking ${booking.id} already in terminal state: ${booking.status}`);
           return;
      }
@@ -409,8 +392,6 @@ const handlePaymentFailure = async (paymentOrderId, reason) => {
           logger.warn(`Booking ${booking.id} in unexpected status: ${booking.status}`);
           return;
      }
-
-     const seatIds = booking.seats.map(s => s.seatId).sort();
 
      // Atomically claim this booking before compensating
      try {
@@ -426,21 +407,13 @@ const handlePaymentFailure = async (paymentOrderId, reason) => {
           throw error;
      }
 
-     // Compensate: release held seats
-     await saga.compensateHoldSeats(booking, seatIds);
+     await saga.compensateHold(booking);
+     await forceReleaseBookingLock(booking);
 
-     // Release Redis locks (segment-aware)
-     await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
-
-     // Publish BOOKING_FAILED
      try {
           const userInfo = await fetchUserForNotification(booking.userId);
           await bookingProducer.publishBookingFailed({
-               bookingId: booking.id,
-               userId: booking.userId,
-               email: userInfo.email,
-               firstName: userInfo.firstName,
-               scheduleId: booking.scheduleId,
+               ...toEventPayload(booking, userInfo),
                reason: reason || 'payment_failed',
           });
      } catch (err) {
@@ -453,16 +426,9 @@ const handlePaymentFailure = async (paymentOrderId, reason) => {
 // ─── Cancel Booking ──────────────────────────────────────────────────────────
 
 const cancelBooking = async (bookingId, userId) => {
-     const booking = await prisma.booking.findUnique({
-          where: { id: bookingId },
-          include: { seats: true },
-     });
+     const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
 
-     if (!booking) {
-          throw new NotFoundError('Booking not found');
-     }
-
-     if (booking.userId !== userId) {
+     if (!booking || booking.userId !== userId) {
           throw new NotFoundError('Booking not found');
      }
 
@@ -470,8 +436,14 @@ const cancelBooking = async (bookingId, userId) => {
           throw new ConflictError(`Booking is already ${booking.status}`);
      }
 
-     const seatIds = booking.seats.map(s => s.seatId).sort();
-     let refundInitiated = false;
+     // Cancellation policy only applies to paid (confirmed) bookings
+     const refund = booking.status === 'CONFIRMED'
+          ? calculateRefund(booking.totalAmount, booking.pickupAt)
+          : { refundable: true, refundAmount: 0, policy: 'unpaid' };
+
+     if (!refund.refundable) {
+          throw new BadRequestError('This rental has already started and can no longer be cancelled');
+     }
 
      // Atomically claim this booking — prevents race with payment webhook or expiry job
      try {
@@ -481,7 +453,6 @@ const cancelBooking = async (bookingId, userId) => {
           });
      } catch (error) {
           if (error.code === 'STALE_STATE') {
-               // Re-read to give user accurate error
                const fresh = await prisma.booking.findUnique({ where: { id: bookingId } });
                throw new ConflictError(
                     `Booking status changed to ${fresh?.status || 'unknown'} while cancelling. Please refresh.`
@@ -490,34 +461,31 @@ const cancelBooking = async (bookingId, userId) => {
           throw error;
      }
 
+     let refundInitiated = false;
+
      if (booking.status === 'CONFIRMED') {
-          // Cancel confirmed booking: release seats + refund
+          // Release the car + refund according to the policy
           try {
-               await inventoryClient.cancelBooking(booking.scheduleId, booking.id, booking.userId);
+               await holds.cancelReservation(booking);
           } catch (error) {
-               logger.error(`Failed to release seats in inventory for booking ${booking.id}`, {
+               logger.error(`Failed to release car in inventory for booking ${booking.id}`, {
                     error: error.message,
                });
                // Roll back from CANCELLING to CONFIRMED so the user can retry
                await prisma.booking.updateMany({
                     where: { id: booking.id, status: 'CANCELLING' },
-                    data: {
-                         status: 'CONFIRMED',
-                         failureReason: null,
-                         version: { increment: 1 },
-                    },
+                    data: { status: 'CONFIRMED', failureReason: null, version: { increment: 1 } },
                });
                throw error;
           }
 
-          if (booking.paymentOrderId) {
+          if (booking.paymentOrderId && refund.refundAmount > 0) {
                try {
-                    const idempotencyKey = `${booking.id}-cancel-refund`;
                     await paymentClient.initiateRefund(
                          booking.paymentOrderId,
-                         booking.totalAmount,
-                         'user_cancelled',
-                         idempotencyKey
+                         refund.refundAmount,
+                         `user_cancelled:${refund.policy}`,
+                         `${booking.id}-cancel-refund`
                     );
                     refundInitiated = true;
                } catch (error) {
@@ -526,118 +494,141 @@ const cancelBooking = async (bookingId, userId) => {
                     });
                }
           }
-     } else if (['PAYMENT_PENDING', 'SEATS_HELD'].includes(booking.status)) {
-          // Release held seats
+     } else if (['PAYMENT_PENDING', 'CAR_HELD'].includes(booking.status)) {
           try {
-               // --- SEGMENT BOOKING: Pass segment params for accurate release ---
-               await inventoryClient.releaseSeats(booking.scheduleId, seatIds, booking.userId, booking.fromSeq, booking.toSeq);
+               await holds.releaseHold(booking);
           } catch (error) {
-               logger.error(`Failed to release seats during cancel`, { error: error.message });
+               logger.error(`Failed to release car during cancel`, { error: error.message });
           }
      }
 
-     // Final status (CANCELLING → CANCELLED)
+     const refundAmount = refundInitiated ? refund.refundAmount : 0;
+
      await prisma.booking.updateMany({
           where: { id: booking.id, status: 'CANCELLING' },
-          data: {
-               status: 'CANCELLED',
-               version: { increment: 1 },
-          },
+          data: { status: 'CANCELLED', refundAmount, version: { increment: 1 } },
      });
 
-     // Release Redis locks (segment-aware)
-     await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+     await forceReleaseBookingLock(booking);
 
-     // Publish BOOKING_CANCELLED
      try {
           const userInfo = await fetchUserForNotification(booking.userId);
           await bookingProducer.publishBookingCancelled({
-               bookingId: booking.id,
-               userId: booking.userId,
-               email: userInfo.email,
-               firstName: userInfo.firstName,
-               scheduleId: booking.scheduleId,
+               ...toEventPayload(booking, userInfo),
                reason: 'user_cancelled',
-               refundAmount: refundInitiated ? booking.totalAmount : 0,
+               refundPolicy: refund.policy,
+               refundAmount,
           });
      } catch (err) {
           logger.error('Failed to publish BOOKING_CANCELLED after retries', { bookingId: booking.id, error: err.message });
      }
 
-     logger.info(`Booking ${booking.id} cancelled by user ${userId}`);
+     logger.info(`Booking ${booking.id} cancelled by user ${userId}`, { refundAmount, policy: refund.policy });
 
      return {
           bookingId: booking.id,
           status: 'CANCELLED',
           refundInitiated,
+          refundAmount,
+          refundPolicy: refund.policy,
      };
 };
 
-// ─── Get Booking ─────────────────────────────────────────────────────────────
+// ─── Read APIs ───────────────────────────────────────────────────────────────
+
+const toBookingView = (b) => ({
+     id: b.id,
+     type: b.type,
+     status: b.status,
+     carId: b.carId,
+     carName: b.carName,
+     registrationNumber: b.registrationNumber,
+     category: b.category,
+     branchId: b.branchId,
+     branchName: b.branchName,
+     city: b.city,
+     pickupAt: b.pickupAt,
+     dropoffAt: b.dropoffAt,
+     rentalDays: b.rentalDays,
+     dailyRate: b.dailyRate,
+     baseAmount: b.baseAmount,
+     discountAmount: b.discountAmount,
+     totalAmount: b.totalAmount,
+     refundAmount: b.refundAmount,
+     driver: b.driverName ? {
+          name: b.driverName,
+          age: b.driverAge,
+          licenseNumber: b.driverLicenseNumber,
+          phone: b.driverPhone,
+     } : null,
+     // shared rides
+     tripId: b.tripId,
+     routeName: b.routeName,
+     fromSeq: b.fromSeq,
+     toSeq: b.toSeq,
+     fromStopName: b.fromStopName,
+     toStopName: b.toStopName,
+     seatNumbers: b.seatNumbers,
+     seatFare: b.seatFare,
+     passengers: b.passengers,
+     paymentOrderId: b.paymentOrderId,
+     lockExpiresAt: b.lockExpiresAt,
+     failureReason: b.failureReason,
+     createdAt: b.createdAt,
+     updatedAt: b.updatedAt,
+});
 
 const getBooking = async (bookingId, userId) => {
-     const booking = await prisma.booking.findUnique({
-          where: { id: bookingId },
-          include: {
-               seats: { orderBy: { seatNumber: 'asc' } },
-               passengers: true,
-          },
-     });
+     const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
 
      if (!booking || booking.userId !== userId) {
           throw new NotFoundError('Booking not found');
      }
 
-     return {
-          id: booking.id,
-          status: booking.status,
-          scheduleId: booking.scheduleId,
-          trainId: booking.trainId,
-          trainNumber: booking.trainNumber,
-          trainName: booking.trainName,
-          departureDate: booking.departureDate,
-          totalAmount: booking.totalAmount,
-          seatCount: booking.seatCount,
-          fromStationId: booking.fromStationId,  // --- SEGMENT BOOKING
-          toStationId: booking.toStationId,      // --- SEGMENT BOOKING
-          fromSeq: booking.fromSeq,              // --- SEGMENT BOOKING
-          toSeq: booking.toSeq,                  // --- SEGMENT BOOKING
-          paymentOrderId: booking.paymentOrderId,
-          lockExpiresAt: booking.lockExpiresAt,
-          failureReason: booking.failureReason,
-          seats: booking.seats.map(s => ({
-               seatId: s.seatId,
-               seatNumber: s.seatNumber,
-               seatType: s.seatType,
-               price: s.price,
-          })),
-          passengers: booking.passengers.map(p => ({
-               id: p.id,
-               name: p.name,
-               age: p.age,
-               gender: p.gender,
-               seatId: p.seatId,
-          })),
-          createdAt: booking.createdAt,
-          updatedAt: booking.updatedAt,
-     };
+     const view = toBookingView(booking);
+     if (booking.status === 'CONFIRMED') {
+          view.cancellationPreview = calculateRefund(booking.totalAmount, booking.pickupAt);
+     }
+
+     // Let the customer reopen checkout if they closed the payment window while the car is held
+     if (booking.status === 'PAYMENT_PENDING' && booking.lockExpiresAt > new Date()) {
+          const step = await prisma.sagaLog.findFirst({
+               where: { bookingId: booking.id, step: 'CREATE_PAYMENT', status: 'COMPLETED' },
+               orderBy: { createdAt: 'desc' },
+          });
+          if (step?.response?.gatewayOrderId) {
+               view.payment = {
+                    gatewayOrderId: step.response.gatewayOrderId,
+                    amount: step.response.amount,
+                    currency: step.response.currency,
+                    keyId: step.response.keyId,
+               };
+          }
+     }
+     return view;
 };
 
-// ─── Get User Bookings ───────────────────────────────────────────────────────
-
-const getUserBookings = async (userId, { status, page = 1, limit = 10 } = {}) => {
+const getUserBookings = async (userId, { status, when, page = 1, limit = 10 } = {}) => {
      const skip = (page - 1) * limit;
      const where = { userId };
      if (status) where.status = status.toUpperCase();
 
+     // upcoming = still relevant (active and not yet returned); past = everything else
+     const now = new Date();
+     if (when === 'upcoming') {
+          where.status = { in: ACTIVE_STATUSES };
+          where.dropoffAt = { gt: now };
+     } else if (when === 'past') {
+          where.OR = [
+               { status: { notIn: ACTIVE_STATUSES } },
+               { dropoffAt: { lte: now } },
+          ];
+     }
+
      const [bookings, total] = await Promise.all([
           prisma.booking.findMany({
                where,
-               include: {
-                    seats: { orderBy: { seatNumber: 'asc' } },
-                    passengers: true,
-               },
-               orderBy: { createdAt: 'desc' },
+               orderBy: when === 'upcoming' ? { pickupAt: 'asc' } : { createdAt: 'desc' },
                skip,
                take: limit,
           }),
@@ -645,32 +636,7 @@ const getUserBookings = async (userId, { status, page = 1, limit = 10 } = {}) =>
      ]);
 
      return {
-          bookings: bookings.map(b => ({
-               id: b.id,
-               status: b.status,
-               scheduleId: b.scheduleId,
-               trainNumber: b.trainNumber,
-               trainName: b.trainName,
-               departureDate: b.departureDate,
-               totalAmount: b.totalAmount,
-               seatCount: b.seatCount,
-               fromStationId: b.fromStationId,  // --- SEGMENT BOOKING
-               toStationId: b.toStationId,      // --- SEGMENT BOOKING
-               fromSeq: b.fromSeq,              // --- SEGMENT BOOKING
-               toSeq: b.toSeq,                  // --- SEGMENT BOOKING
-               seats: b.seats.map(s => ({
-                    seatId: s.seatId,
-                    seatNumber: s.seatNumber,
-                    seatType: s.seatType,
-                    price: s.price,
-               })),
-               passengers: b.passengers.map(p => ({
-                    name: p.name,
-                    age: p.age,
-                    gender: p.gender,
-               })),
-               createdAt: b.createdAt,
-          })),
+          bookings: bookings.map(toBookingView),
           pagination: {
                page,
                limit,
@@ -683,9 +649,7 @@ const getUserBookings = async (userId, { status, page = 1, limit = 10 } = {}) =>
 // ─── Verify Payment (client-side verification after Razorpay checkout) ───────
 
 const verifyPayment = async (bookingId, userId, razorpayPaymentId, razorpaySignature) => {
-     const booking = await prisma.booking.findUnique({
-          where: { id: bookingId },
-     });
+     const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
 
      if (!booking || booking.userId !== userId) {
           throw new NotFoundError('Booking not found');
@@ -703,7 +667,6 @@ const verifyPayment = async (bookingId, userId, razorpayPaymentId, razorpaySigna
           throw new ConflictError(`Booking is in ${booking.status} status, cannot verify payment`);
      }
 
-     // Call payment service to verify and capture
      const result = await paymentClient.verifyPayment(
           booking.paymentOrderId,
           razorpayPaymentId,
@@ -718,107 +681,245 @@ const verifyPayment = async (bookingId, userId, razorpayPaymentId, razorpaySigna
      };
 };
 
-// ─── Handle Schedule Cancelled (Kafka consumer) ─────────────────────────────
-// When a schedule is cancelled, all active bookings on that schedule must be
-// failed/cancelled so users aren't left with stranded tickets.
+// ─── Bulk cancellation (Kafka consumers) ─────────────────────────────────────
+// When a car leaves the fleet or a shared-ride trip is cancelled, every upcoming
+// booking it affects is cancelled with a FULL refund — the customer did nothing wrong.
 
-const handleScheduleCancelled = async (scheduleId) => {
-     if (!scheduleId) {
-          logger.warn('handleScheduleCancelled called without scheduleId');
-          return;
-     }
-
-     const activeBookings = await prisma.booking.findMany({
-          where: {
-               scheduleId,
-               status: { in: ['PENDING', 'SEATS_HELD', 'PAYMENT_PENDING', 'CONFIRMED'] },
-          },
-          include: { seats: true },
+const cancelAffectedBookings = async (where, reason, label) => {
+     const affected = await prisma.booking.findMany({
+          where: { ...where, status: { in: ACTIVE_STATUSES }, dropoffAt: { gt: new Date() } },
      });
 
-     if (activeBookings.length === 0) {
-          logger.info(`No active bookings to cancel for schedule ${scheduleId}`);
-          return;
+     if (affected.length === 0) {
+          logger.info(`No upcoming bookings affected (${label})`);
+          return 0;
      }
+     logger.info(`Cancelling ${affected.length} booking(s): ${label}`);
 
-     logger.info(`Cancelling ${activeBookings.length} active booking(s) due to schedule cancellation`, { scheduleId });
-
-     for (const booking of activeBookings) {
+     for (const booking of affected) {
           try {
-               // CAS: claim ownership of this booking transition
+               const refundDue = booking.status === 'CONFIRMED' ? booking.totalAmount : 0;
                const claimed = await prisma.booking.updateMany({
-                    where: {
-                         id: booking.id,
-                         version: booking.version,
-                         status: { in: ['PENDING', 'SEATS_HELD', 'PAYMENT_PENDING', 'CONFIRMED'] },
-                    },
-                    data: {
-                         status: 'CANCELLED',
-                         failureReason: 'schedule_cancelled',
-                         version: { increment: 1 },
-                    },
+                    where: { id: booking.id, version: booking.version, status: { in: ACTIVE_STATUSES } },
+                    data: { status: 'CANCELLED', failureReason: reason, version: { increment: 1 } },
                });
-
                if (claimed.count === 0) {
-                    logger.info(`Booking ${booking.id} already handled, skipping schedule-cancel`);
+                    logger.info(`Booking ${booking.id} already handled, skipping`);
                     continue;
                }
 
-               const seatIds = booking.seats.map(s => s.seatId).sort();
+               try {
+                    await holds.cancelReservation(booking);
+               } catch (err) {
+                    // No hold (e.g. PENDING) is fine; anything else is cleaned by lock expiry
+                    logger.warn(`Could not release hold for booking ${booking.id}`, { error: err.message });
+               }
+               await forceReleaseBookingLock(booking);
 
-               // Release Redis locks if any are still held
-               await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
-
-               // Initiate refund for confirmed bookings that had payment
-               if (booking.status === 'CONFIRMED' && booking.paymentOrderId) {
+               // Record the refund only once it has actually been initiated (same as user cancellations)
+               let refundAmount = 0;
+               if (refundDue > 0 && booking.paymentOrderId) {
                     try {
-                         const idempotencyKey = `${booking.id}-schedule-cancel-refund`;
-                         await paymentClient.initiateRefund(
-                              booking.paymentOrderId,
-                              booking.totalAmount,
-                              'schedule_cancelled',
-                              idempotencyKey
-                         );
+                         await paymentClient.initiateRefund(booking.paymentOrderId, refundDue, reason, `${booking.id}-${reason}-refund`);
+                         refundAmount = refundDue;
+                         await prisma.booking.update({ where: { id: booking.id }, data: { refundAmount } });
                     } catch (refundErr) {
-                         logger.error(`Failed to initiate refund for booking ${booking.id} during schedule cancellation`, {
-                              error: refundErr.message,
-                         });
+                         logger.error(`Failed to initiate refund for booking ${booking.id}`, { error: refundErr.message });
                     }
                }
 
-               // Publish BOOKING_CANCELLED event
                try {
                     const userInfo = await fetchUserForNotification(booking.userId);
-                    await bookingProducer.publishBookingCancelled({
-                         bookingId: booking.id,
-                         userId: booking.userId,
-                         email: userInfo.email,
-                         firstName: userInfo.firstName,
-                         scheduleId: booking.scheduleId,
-                         reason: 'schedule_cancelled',
-                         refundAmount: booking.status === 'CONFIRMED' ? booking.totalAmount : 0,
-                    });
+                    await bookingProducer.publishBookingCancelled({ ...toEventPayload(booking, userInfo), reason, refundAmount });
                } catch (err) {
-                    logger.error('Failed to publish BOOKING_CANCELLED for schedule cancellation', {
-                         bookingId: booking.id,
-                         error: err.message,
-                    });
+                    logger.error('Failed to publish BOOKING_CANCELLED', { bookingId: booking.id, error: err.message });
                }
-
-               logger.info(`Booking ${booking.id} cancelled due to schedule cancellation`);
           } catch (error) {
-               logger.error(`Failed to cancel booking ${booking.id} during schedule cancellation`, {
-                    error: error.message,
+               logger.error(`Failed to cancel booking ${booking.id} (${label})`, { error: error.message });
+          }
+     }
+     return affected.length;
+};
+
+const handleCarDeactivated = (carId, status) => {
+     if (!carId) return logger.warn('handleCarDeactivated called without carId');
+     return cancelAffectedBookings({ carId }, 'car_unavailable', `car ${carId} went ${status}`);
+};
+
+const handleTripCancelled = (tripId, reason) => {
+     if (!tripId) return logger.warn('handleTripCancelled called without tripId');
+     return cancelAffectedBookings({ tripId }, reason === 'car_unavailable' ? 'car_unavailable' : 'trip_cancelled', `trip ${tripId} cancelled`);
+};
+
+// ─── Shared rides: seat bookings ─────────────────────────────────────────────
+
+const MAX_SEATS_PER_BOOKING = 6;
+const SEAT_BOOKING_CUTOFF_MS = 30 * 60 * 1000; // stop selling 30 min before boarding
+const GENDERS = ['MALE', 'FEMALE', 'OTHER'];
+
+/** Live seat map for the stretch + the two stops, with sales-cutoff checks. */
+const loadTripStretch = async (tripId, fromSeq, toSeq) => {
+     if (!tripId || !fromSeq || !toSeq) throw new BadRequestError('tripId, fromSeq and toSeq are required');
+     const seatMap = await inventoryClient.getSeatMap(tripId, fromSeq, toSeq);
+     if (seatMap.status !== 'SCHEDULED') throw new BadRequestError('This trip is no longer running');
+
+     const fromStop = seatMap.stops[seatMap.fromSeq - 1];
+     const toStop = seatMap.stops[seatMap.toSeq - 1];
+     if (new Date(fromStop.time).getTime() < Date.now() + SEAT_BOOKING_CUTOFF_MS) {
+          throw new BadRequestError('Booking for this stop has closed (it departs in less than 30 minutes)');
+     }
+     return { seatMap, fromStop, toStop };
+};
+
+const getSeatQuote = async (tripId, fromSeq, toSeq, seatCount = 1) => {
+     const count = Math.max(1, Math.min(MAX_SEATS_PER_BOOKING, Number(seatCount) || 1));
+     const { seatMap, fromStop, toStop } = await loadTripStretch(tripId, fromSeq, toSeq);
+     return {
+          tripId,
+          routeName: seatMap.routeName,
+          car: seatMap.car,
+          driverName: seatMap.driverName,
+          fromSeq: seatMap.fromSeq,
+          toSeq: seatMap.toSeq,
+          fromStop,
+          toStop,
+          seatsLeft: seatMap.seatsLeft,
+          seats: seatMap.seats,
+          ...calculateSeatFare(seatMap.farePerKm, fromStop.distanceKm, toStop.distanceKm, count),
+     };
+};
+
+const validatePassengers = (passengers, seatNumbers) => {
+     if (!Array.isArray(passengers) || passengers.length !== seatNumbers.length) {
+          throw new BadRequestError('Add one passenger for each selected seat');
+     }
+     passengers.forEach((p, i) => {
+          if (!p?.name || String(p.name).trim().length < 2) throw new BadRequestError(`Passenger ${i + 1}: name is required`);
+          const age = Number(p.age);
+          if (!Number.isInteger(age) || age < 1 || age > 120) throw new BadRequestError(`Passenger ${i + 1}: enter a valid age`);
+          if (!GENDERS.includes(String(p.gender).toUpperCase())) throw new BadRequestError(`Passenger ${i + 1}: select a gender`);
+     });
+};
+
+const createSeatBooking = async (userId, { tripId, fromSeq, toSeq, seatNumbers, passengers, idempotencyKey }) => {
+     if (!idempotencyKey) throw new BadRequestError('idempotencyKey is required');
+     const seats = [...new Set((seatNumbers || []).map(Number))];
+     if (seats.length === 0) throw new BadRequestError('Select at least one seat');
+     if (seats.length !== (seatNumbers || []).length) throw new BadRequestError('Each seat can be selected only once');
+     if (seats.length > MAX_SEATS_PER_BOOKING) throw new BadRequestError(`You can book up to ${MAX_SEATS_PER_BOOKING} seats at a time`);
+     validatePassengers(passengers, seats);
+
+     const cached = await checkIdempotency(`booking:${idempotencyKey}`);
+     if (cached) return cached;
+
+     const { seatMap, fromStop, toStop } = await loadTripStretch(tripId, fromSeq, toSeq);
+     const missing = seats.filter((n) => !Number.isInteger(n) || n < 1 || n > seatMap.passengerSeats);
+     if (missing.length) {
+          throw new BadRequestError(`Seat ${missing.join(', ')} doesn't exist — this car has seats 1 to ${seatMap.passengerSeats}`);
+     }
+     const taken = seats.filter((n) => !seatMap.seats.find((s) => s.seatNumber === n)?.available);
+     if (taken.length) {
+          throw new ConflictError(`Seat ${taken.join(', ')} is no longer available for your stretch`, 'SEATS_UNAVAILABLE');
+     }
+     const fare = calculateSeatFare(seatMap.farePerKm, fromStop.distanceKm, toStop.distanceKm, seats.length);
+     const from = seatMap.fromSeq;
+     const to = seatMap.toSeq;
+
+     const lockKeys = tripSeatLockKeys(tripId, seats, from, to);
+     const { acquired, lockValue } = await acquireKeys(lockKeys, `pre-${Date.now()}`, config.BOOKING_TTL_SECONDS);
+     if (!acquired) {
+          throw new ConflictError('Someone else is booking one of these seats right now. Please try again.', 'SEATS_LOCKED');
+     }
+
+     let booking;
+     try {
+          booking = await prisma.booking.create({
+               data: {
+                    type: 'SEAT',
+                    userId,
+                    carId: seatMap.car.carId,
+                    registrationNumber: seatMap.car.registrationNumber,
+                    carName: `${seatMap.car.make} ${seatMap.car.model}`,
+                    category: seatMap.car.category,
+                    branchId: fromStop.branchId,
+                    branchName: fromStop.name,
+                    city: fromStop.city,
+                    pickupAt: new Date(fromStop.time),
+                    dropoffAt: new Date(toStop.time),
+                    status: 'PENDING',
+                    baseAmount: fare.baseAmount,
+                    discountAmount: 0,
+                    totalAmount: fare.totalAmount,
+                    tripId,
+                    routeName: seatMap.routeName,
+                    fromSeq: from,
+                    toSeq: to,
+                    fromStopName: fromStop.name,
+                    toStopName: toStop.name,
+                    seatNumbers: seats,
+                    seatFare: fare.seatFare,
+                    passengers: passengers.map((p, i) => ({
+                         name: String(p.name).trim(),
+                         age: Number(p.age),
+                         gender: String(p.gender).toUpperCase(),
+                         seatNumber: seats[i],
+                    })),
+                    idempotencyKey,
+                    lockExpiresAt: new Date(Date.now() + config.BOOKING_TTL_SECONDS * 1000),
+               },
+          });
+
+          await saga.executeHold(booking, config.LOCK_TTL_SECONDS);
+          const paymentOrder = await saga.executeCreatePayment(booking);
+          booking = await prisma.booking.findUnique({ where: { id: booking.id } });
+
+          const response = {
+               bookingId: booking.id,
+               type: 'SEAT',
+               status: booking.status,
+               carName: booking.carName,
+               routeName: booking.routeName,
+               fromStopName: booking.fromStopName,
+               toStopName: booking.toStopName,
+               pickupAt: booking.pickupAt,
+               dropoffAt: booking.dropoffAt,
+               seatNumbers: booking.seatNumbers,
+               seatFare: booking.seatFare,
+               totalAmount: booking.totalAmount,
+               lockExpiresAt: booking.lockExpiresAt,
+               paymentOrder: {
+                    paymentOrderId: paymentOrder.paymentOrderId,
+                    gatewayOrderId: paymentOrder.gatewayOrderId,
+                    amount: paymentOrder.amount,
+                    currency: paymentOrder.currency,
+                    keyId: paymentOrder.keyId,
+               },
+          };
+          await saveIdempotency(`booking:${idempotencyKey}`, response);
+          return response;
+     } catch (error) {
+          logger.error(`Seat booking failed for user ${userId}`, { error: error.message });
+          if (booking) {
+               await saga.compensateAll(booking);
+               await prisma.booking.update({
+                    where: { id: booking.id },
+                    data: { status: 'FAILED', failureReason: error.response?.data?.message || error.message },
                });
           }
+          await releaseKeys(lockKeys, lockValue);
+          throw error;
      }
 };
 
 module.exports = {
+     getQuote,
      createBooking,
+     getSeatQuote,
+     createSeatBooking,
      handlePaymentSuccess,
      handlePaymentFailure,
-     handleScheduleCancelled,
+     handleCarDeactivated,
+     handleTripCancelled,
      cancelBooking,
      getBooking,
      getUserBookings,

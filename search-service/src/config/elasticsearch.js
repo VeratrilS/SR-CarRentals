@@ -4,23 +4,23 @@ const logger = require('./logger');
 
 const esClient = new Client({ node: config.ELASTICSEARCH_URL });
 
-const STATION_INDEX = 'stations';
-const TRAIN_INDEX = 'trains';
-const ROUTE_INDEX = 'routes';
-const SCHEDULE_INDEX = 'schedules';
+const BRANCH_INDEX = 'branches';
+const CAR_INDEX = 'cars';
+const TRIP_INDEX = 'trips';
 
 /**
  * Create indices with mappings that power:
  *   • Fuzzy search  (match + fuzziness)
  *   • Autocomplete  (completion suggester)
- *   • Full-text     (text analyzer)
+ *   • Availability  (date_range field — cars whose booked ranges intersect
+ *                    the requested pickup/drop-off window are filtered out)
  */
 const initIndices = async () => {
-     // ── Station index (for autocomplete) ──
-     const stationExists = await esClient.indices.exists({ index: STATION_INDEX });
-     if (!stationExists) {
+     // ── Branch index (for location autocomplete) ──
+     const branchExists = await esClient.indices.exists({ index: BRANCH_INDEX });
+     if (!branchExists) {
           await esClient.indices.create({
-               index: STATION_INDEX,
+               index: BRANCH_INDEX,
                settings: {
                     analysis: {
                          analyzer: {
@@ -43,73 +43,109 @@ const initIndices = async () => {
                                    token_chars: ['letter', 'digit'],
                               },
                          },
+                         normalizer: {
+                              lowercase_normalizer: { type: 'custom', filter: ['lowercase'] },
+                         },
                     },
                },
                mappings: {
                     properties: {
-                         stationId: { type: 'keyword' },
+                         branchId: { type: 'keyword' },
                          name: { type: 'text', analyzer: 'autocomplete_analyzer', search_analyzer: 'search_analyzer' },
                          code: { type: 'keyword' },
-                         city: { type: 'text', analyzer: 'autocomplete_analyzer', search_analyzer: 'search_analyzer' },
+                         city: {
+                              type: 'text',
+                              analyzer: 'autocomplete_analyzer',
+                              search_analyzer: 'search_analyzer',
+                              fields: { kw: { type: 'keyword', normalizer: 'lowercase_normalizer' } },
+                         },
+                         address: { type: 'text' },
                          suggest: { type: 'completion' },
                     },
                },
           });
-          logger.info('Station index created');
+          logger.info('Branch index created');
      }
 
-     // ── Train index ──
-     const trainExists = await esClient.indices.exists({ index: TRAIN_INDEX });
-     if (!trainExists) {
+     // ── Car index ──
+     const carExists = await esClient.indices.exists({ index: CAR_INDEX });
+     if (!carExists) {
           await esClient.indices.create({
-               index: TRAIN_INDEX,
+               index: CAR_INDEX,
+               settings: {
+                    analysis: {
+                         normalizer: {
+                              lowercase_normalizer: { type: 'custom', filter: ['lowercase'] },
+                         },
+                    },
+               },
                mappings: {
                     properties: {
-                         trainId: { type: 'keyword' },
-                         trainNumber: { type: 'keyword' },
-                         trainName: { type: 'text' },
-                         route: {
-                              type: 'nested',
+                         carId: { type: 'keyword' },
+                         registrationNumber: { type: 'keyword' },
+                         make: { type: 'text', fields: { kw: { type: 'keyword' } } },
+                         model: { type: 'text', fields: { kw: { type: 'keyword' } } },
+                         year: { type: 'integer' },
+                         category: { type: 'keyword' },
+                         transmission: { type: 'keyword' },
+                         fuelType: { type: 'keyword' },
+                         seats: { type: 'integer' },
+                         dailyRate: { type: 'float' },
+                         imageUrl: { type: 'keyword', index: false },
+                         status: { type: 'keyword' },
+                         branch: {
                               properties: {
-                                   stationId: { type: 'keyword' },
-                                   stationName: { type: 'text' },
-                                   stationCode: { type: 'keyword' },
-                                   sequenceNumber: { type: 'integer' },
-                                   arrivalTime: { type: 'keyword' },
-                                   departureTime: { type: 'keyword' },
-                                   distanceFromOrigin: { type: 'float' },
+                                   branchId: { type: 'keyword' },
+                                   name: { type: 'text' },
+                                   code: { type: 'keyword' },
+                                   city: { type: 'keyword', normalizer: 'lowercase_normalizer' },
                               },
                          },
-                         schedules: {
+                         // Each entry is { gte: startAt, lt: endAt } — a booked/held interval
+                         blockedRanges: { type: 'date_range' },
+                    },
+               },
+          });
+          logger.info('Car index created');
+     }
+
+     // -- Trip index (shared rides) --
+     const tripExists = await esClient.indices.exists({ index: TRIP_INDEX });
+     if (!tripExists) {
+          await esClient.indices.create({
+               index: TRIP_INDEX,
+               mappings: {
+                    properties: {
+                         tripId: { type: 'keyword' },
+                         routeName: { type: 'text' },
+                         status: { type: 'keyword' },
+                         departureAt: { type: 'date' },
+                         arrivalAt: { type: 'date' },
+                         driverName: { type: 'text' },
+                         farePerKm: { type: 'float' },
+                         passengerSeats: { type: 'integer' },
+                         car: { type: 'object', enabled: false },
+                         stops: {
                               type: 'nested',
                               properties: {
-                                   scheduleId: { type: 'keyword' },
-                                   departureDate: { type: 'date' },
-                                   status: { type: 'keyword' },
-                                   available: { type: 'integer' },
-                                   locked: { type: 'integer' },
-                                   booked: { type: 'integer' },
-                              },
-                         },
-                         seatSummary: {
-                              properties: {
-                                   total: { type: 'integer' },
-                                   LOWER: { type: 'integer' },
-                                   MIDDLE: { type: 'integer' },
-                                   UPPER: { type: 'integer' },
-                                   SIDE_LOWER: { type: 'integer' },
-                                   SIDE_UPPER: { type: 'integer' },
+                                   sequence: { type: 'integer' },
+                                   branchId: { type: 'keyword' },
+                                   name: { type: 'text' },
+                                   code: { type: 'keyword' },
+                                   city: { type: 'keyword' },
+                                   time: { type: 'date' },
+                                   distanceKm: { type: 'float' },
                               },
                          },
                     },
                },
           });
-          logger.info('Train index created');
+          logger.info('Trip index created');
      }
 };
 
 const recreateIndices = async () => {
-     for (const index of [STATION_INDEX, TRAIN_INDEX]) {
+     for (const index of [BRANCH_INDEX, CAR_INDEX, TRIP_INDEX]) {
           const exists = await esClient.indices.exists({ index });
           if (exists) {
                await esClient.indices.delete({ index });
@@ -120,4 +156,4 @@ const recreateIndices = async () => {
      logger.info('All indices recreated');
 };
 
-module.exports = { esClient, STATION_INDEX, TRAIN_INDEX, ROUTE_INDEX, SCHEDULE_INDEX, initIndices, recreateIndices };
+module.exports = { esClient, BRANCH_INDEX, CAR_INDEX, TRIP_INDEX, initIndices, recreateIndices };

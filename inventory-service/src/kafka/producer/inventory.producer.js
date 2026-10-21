@@ -55,11 +55,11 @@ class InventoryProducer {
           throw lastError;
      }
 
-     async publishSeatAvailabilityUpdated(scheduleId, trainId, available, locked, booked) {
+     async publishCarAvailabilityUpdated(carId, status, blockedRanges) {
           return this.sendMessage(
-               KAFKA_TOPICS.SEAT_AVAILABILITY_UPDATED,
-               `schedule-${scheduleId}`,
-               { scheduleId, trainId, available, locked, booked }
+               KAFKA_TOPICS.CAR_AVAILABILITY_UPDATED,
+               `car-${carId}`,
+               { carId, status, blockedRanges }
           );
      }
 }

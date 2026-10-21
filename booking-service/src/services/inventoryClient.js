@@ -52,75 +52,93 @@ function extractError(error) {
 }
 
 const inventoryClient = {
-     async getAvailability(scheduleId) {
-          return withRetry(async () => {
-               const { data } = await client.get(`/schedules/${scheduleId}/availability`);
-               return data.data;
-          });
-     },
-
-     async getSeats(scheduleId, filters = {}) {
+     async getAvailability(carId, startAt, endAt) {
           return withRetry(async () => {
                const params = {};
-               if (filters.status) params.status = filters.status;
-               if (filters.seatType) params.seatType = filters.seatType;
-               if (filters.fromSeq) params.fromSeq = filters.fromSeq;  // --- SEGMENT BOOKING
-               if (filters.toSeq) params.toSeq = filters.toSeq;        // --- SEGMENT BOOKING
-
-               const { data } = await client.get(`/schedules/${scheduleId}/seats`, { params });
+               if (startAt && endAt) {
+                    params.startAt = new Date(startAt).toISOString();
+                    params.endAt = new Date(endAt).toISOString();
+               }
+               const { data } = await client.get(`/cars/${carId}/availability`, { params });
                return data.data;
           });
      },
 
-     // --- SEGMENT BOOKING: Added fromSeq/toSeq params to holdSeats, releaseSeats, confirmSeats ---
-     async holdSeats(scheduleId, seatIds, userId, ttlSeconds, fromSeq, toSeq) {
+     async holdCar(carId, bookingId, startAt, endAt, userId, ttlSeconds) {
           return withRetry(async () => {
-               const { data } = await client.post('/seats/lock', {
-                    scheduleId,
-                    seatIds,
+               const { data } = await client.post('/holds/lock', {
+                    carId,
+                    bookingId,
+                    startAt,
+                    endAt,
                     userId,
                     ttlSeconds,
-                    fromSeq,  // --- SEGMENT BOOKING
-                    toSeq,    // --- SEGMENT BOOKING
                });
                return data.data;
           });
      },
 
-     async releaseSeats(scheduleId, seatIds, userId, fromSeq, toSeq) {
+     async releaseCar(carId, bookingId, userId) {
           return withRetry(async () => {
-               const { data } = await client.post('/seats/unlock', {
-                    scheduleId,
-                    seatIds,
-                    userId,
-                    fromSeq,  // --- SEGMENT BOOKING
-                    toSeq,    // --- SEGMENT BOOKING
-               });
+               const { data } = await client.post('/holds/release', { carId, bookingId, userId });
                return data.data;
           });
      },
 
-     async confirmSeats(scheduleId, seatIds, userId, bookingId, fromSeq, toSeq) {
+     async confirmCar(carId, bookingId, userId) {
           return withRetry(async () => {
-               const { data } = await client.post('/seats/confirm', {
-                    scheduleId,
-                    seatIds,
-                    userId,
-                    bookingId,
-                    fromSeq,  // --- SEGMENT BOOKING
-                    toSeq,    // --- SEGMENT BOOKING
-               });
+               const { data } = await client.post('/holds/confirm', { carId, bookingId, userId });
                return data.data;
           });
      },
 
-     async cancelBooking(scheduleId, bookingId, userId) {
+     async cancelBooking(carId, bookingId) {
           return withRetry(async () => {
-               const { data } = await client.post('/seats/cancel-booking', {
-                    scheduleId,
-                    bookingId,
-                    userId,
-               });
+               const { data } = await client.post('/holds/cancel-booking', { carId, bookingId });
+               return data.data;
+          });
+     },
+
+     // ─── Shared rides ───
+
+     async getTrip(tripId) {
+          return withRetry(async () => {
+               const { data } = await client.get(`/internal/trips/${tripId}`);
+               return data.data;
+          });
+     },
+
+     async getSeatMap(tripId, fromSeq, toSeq) {
+          return withRetry(async () => {
+               const { data } = await client.get(`/trips/${tripId}/seats`, { params: { fromSeq, toSeq } });
+               return data.data;
+          });
+     },
+
+     async holdTripSeats(tripId, bookingId, seatNumbers, fromSeq, toSeq, userId, ttlSeconds) {
+          return withRetry(async () => {
+               const { data } = await client.post('/trip-holds/lock', { tripId, bookingId, seatNumbers, fromSeq, toSeq, userId, ttlSeconds });
+               return data.data;
+          });
+     },
+
+     async releaseTripSeats(tripId, bookingId) {
+          return withRetry(async () => {
+               const { data } = await client.post('/trip-holds/release', { tripId, bookingId });
+               return data.data;
+          });
+     },
+
+     async confirmTripSeats(tripId, bookingId, userId) {
+          return withRetry(async () => {
+               const { data } = await client.post('/trip-holds/confirm', { tripId, bookingId, userId });
+               return data.data;
+          });
+     },
+
+     async cancelTripSeatBooking(tripId, bookingId) {
+          return withRetry(async () => {
+               const { data } = await client.post('/trip-holds/cancel-booking', { tripId, bookingId });
                return data.data;
           });
      },

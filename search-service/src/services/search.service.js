@@ -1,200 +1,107 @@
-const { esClient, TRAIN_INDEX, STATION_INDEX } = require('../config/elasticsearch');
+const { esClient, CAR_INDEX, BRANCH_INDEX } = require('../config/elasticsearch');
 const logger = require('../config/logger');
+
+// Mirrors booking-service pricing so search can show an estimate.
+// The authoritative price is always the booking-service quote.
+const LONG_RENTAL_MIN_DAYS = 7;
+const LONG_RENTAL_DISCOUNT_PCT = 10;
+const GRACE_MINUTES = 30;
 
 // ═══════════════════════════════════════════════════
 //  INDEX OPERATIONS (called by Kafka consumer)
 // ═══════════════════════════════════════════════════
 
 /**
- * When admin creates a station, index it for autocomplete.
- * Event shape: { eventType, data: { id, name, code, city, state }, timestamp }
+ * Event shape: { eventType, data: { id, name, code, city, state, address }, timestamp }
  */
-const indexStation = async (event) => {
-     const station = event.data;
-     if (!station) return;
-
-     try {
-          await esClient.index({
-               index: STATION_INDEX,
-               id: station.id,
-               document: {
-                    stationId: station.id,
-                    name: station.name,
-                    code: station.code,
-                    city: station.city,
-                    suggest: {
-                         input: [station.name, station.code, station.city].filter(Boolean),
-                         weight: 10,
-                    },
-               },
-               refresh: true,
-          });
-          logger.info(`Indexed station ${station.name} (${station.code})`);
-     } catch (err) {
-          logger.error(`Failed to index station: ${err.message}`);
-     }
-};
-
-/**
- * When admin creates a route, we get enriched payload with train+seats+routeStations.
- */
-const indexTrainRoute = async (routeEvent) => {
-     const { train, routeStations } = routeEvent;
-     if (!train || !routeStations) return;
-
-     const seatSummary = { total: 0, LOWER: 0, MIDDLE: 0, UPPER: 0, SIDE_LOWER: 0, SIDE_UPPER: 0 };
-     (train.seats || []).forEach((s) => {
-          seatSummary.total++;
-          if (seatSummary[s.seatType] !== undefined) seatSummary[s.seatType]++;
-     });
-
-     const doc = {
-          trainId: train.id,
-          trainNumber: train.trainNumber,
-          trainName: train.trainName,
-          route: routeStations.map((rs) => ({
-               stationId: rs.station.id,
-               stationName: rs.station.name,
-               stationCode: rs.station.code,
-               sequenceNumber: rs.sequenceNumber,
-               arrivalTime: rs.arrivalTime,
-               departureTime: rs.departureTime,
-               distanceFromOrigin: rs.distanceFromOrigin,
-          })),
-          schedules: [],
-          seatSummary,
-     };
+const indexBranch = async (event) => {
+     const branch = event.data;
+     if (!branch) return;
 
      await esClient.index({
-          index: TRAIN_INDEX,
-          id: train.id,
-          document: doc,
+          index: BRANCH_INDEX,
+          id: branch.id,
+          document: {
+               branchId: branch.id,
+               name: branch.name,
+               code: branch.code,
+               city: branch.city,
+               address: branch.address,
+               suggest: {
+                    input: [branch.name, branch.code, branch.city].filter(Boolean),
+                    weight: 10,
+               },
+          },
           refresh: true,
      });
-
-     // Also index/update stations for autocomplete
-     for (const rs of routeStations) {
-          await esClient.index({
-               index: STATION_INDEX,
-               id: rs.station.id,
-               document: {
-                    stationId: rs.station.id,
-                    name: rs.station.name,
-                    code: rs.station.code,
-                    city: rs.station.city,
-                    suggest: {
-                         input: [rs.station.name, rs.station.code, rs.station.city].filter(Boolean),
-                         weight: 10,
-                    },
-               },
-               refresh: true,
-          });
-     }
-
-     logger.info(`Indexed train ${train.trainNumber} with ${routeStations.length} stations`);
+     logger.info(`Indexed branch ${branch.name} (${branch.code})`);
 };
 
 /**
- * When admin creates a schedule, add it to the train's schedules array.
+ * CAR_CREATED / CAR_UPDATED. Uses a partial update with upsert so it merges with
+ * blockedRanges that may already have arrived via CAR_AVAILABILITY_UPDATED
+ * (the two topics are not ordered relative to each other).
  */
-const indexSchedule = async (scheduleEvent) => {
-     const { scheduleId, trainId, departureDate, status, seats } = scheduleEvent;
+const upsertCar = async (car) => {
+     if (!car || !car.carId) return;
 
-     const totalSeats = seats ? seats.length : 0;
-
-     try {
-          await esClient.update({
-               index: TRAIN_INDEX,
-               id: trainId,
-               script: {
-                    source: `
-            if (ctx._source.schedules == null) { ctx._source.schedules = []; }
-            // Remove existing schedule with same id (idempotent)
-            ctx._source.schedules.removeIf(s -> s.scheduleId == params.scheduleId);
-            ctx._source.schedules.add(params.newSchedule);
-          `,
-                    params: {
-                         scheduleId,
-                         newSchedule: {
-                              scheduleId,
-                              departureDate,
-                              status,
-                              available: totalSeats,
-                              locked: 0,
-                              booked: 0,
-                         },
-                    },
+     await esClient.update({
+          index: CAR_INDEX,
+          id: car.carId,
+          doc: {
+               carId: car.carId,
+               registrationNumber: car.registrationNumber,
+               make: car.make,
+               model: car.model,
+               year: car.year,
+               category: car.category,
+               transmission: car.transmission,
+               fuelType: car.fuelType,
+               seats: car.seats,
+               dailyRate: car.dailyRate,
+               imageUrl: car.imageUrl || null,
+               status: car.status,
+               branch: {
+                    branchId: car.branch.branchId,
+                    name: car.branch.name,
+                    code: car.branch.code,
+                    city: car.branch.city,
                },
-               refresh: true,
-          });
-          logger.info(`Indexed schedule ${scheduleId} for train ${trainId}`);
-     } catch (err) {
-          logger.warn(`Could not index schedule for train ${trainId}: ${err.message}`);
-     }
+          },
+          doc_as_upsert: true,
+          refresh: true,
+     });
+     logger.info(`Indexed car ${car.make} ${car.model} (${car.registrationNumber})`);
+};
+
+const updateCarStatus = async ({ carId, status }) => {
+     if (!carId) return;
+     await esClient.update({
+          index: CAR_INDEX,
+          id: carId,
+          doc: { status },
+          doc_as_upsert: true,
+          refresh: true,
+     });
+     logger.info(`Car ${carId} status -> ${status}`);
 };
 
 /**
- * When admin cancels a schedule, update its status in ES.
- * Event shape: { eventType, data: { id, trainId, status: 'CANCELLED', ... }, timestamp }
+ * CAR_AVAILABILITY_UPDATED: replace the car's blocked ranges.
  */
-const cancelSchedule = async (event) => {
-     const schedule = event.data;
-     if (!schedule) return;
-
-     try {
-          await esClient.update({
-               index: TRAIN_INDEX,
-               id: schedule.trainId,
-               script: {
-                    source: `
-            if (ctx._source.schedules != null) {
-              for (def s : ctx._source.schedules) {
-                if (s.scheduleId == params.scheduleId) {
-                  s.status = 'CANCELLED';
-                }
-              }
-            }
-          `,
-                    params: { scheduleId: schedule.id },
-               },
-               refresh: true,
-          });
-          logger.info(`Cancelled schedule ${schedule.id} for train ${schedule.trainId}`);
-     } catch (err) {
-          logger.warn(`Could not cancel schedule: ${err.message}`);
-     }
-};
-
-/**
- * When inventory changes (seat booked/released), update availability counts.
- */
-const updateSeatAvailability = async (event) => {
-     const { scheduleId, trainId, available, locked, booked } = event;
-
-     try {
-          await esClient.update({
-               index: TRAIN_INDEX,
-               id: trainId,
-               script: {
-                    source: `
-            if (ctx._source.schedules != null) {
-              for (def s : ctx._source.schedules) {
-                if (s.scheduleId == params.scheduleId) {
-                  s.available = params.available;
-                  s.locked    = params.locked;
-                  s.booked    = params.booked;
-                }
-              }
-            }
-          `,
-                    params: { scheduleId, available: available || 0, locked: locked || 0, booked: booked || 0 },
-               },
-               refresh: true,
-          });
-          logger.info(`Updated availability for schedule ${scheduleId}`);
-     } catch (err) {
-          logger.warn(`Could not update availability: ${err.message}`);
-     }
+const updateCarAvailability = async ({ carId, status, blockedRanges = [] }) => {
+     if (!carId) return;
+     await esClient.update({
+          index: CAR_INDEX,
+          id: carId,
+          doc: {
+               ...(status && { status }),
+               blockedRanges: blockedRanges.map((r) => ({ gte: r.startAt, lt: r.endAt })),
+          },
+          doc_as_upsert: true,
+          refresh: true,
+     });
+     logger.info(`Updated availability for car ${carId} (${blockedRanges.length} blocked range(s))`);
 };
 
 // ═══════════════════════════════════════════════════
@@ -202,193 +109,262 @@ const updateSeatAvailability = async (event) => {
 // ═══════════════════════════════════════════════════
 
 /**
- * Search trains running between two stations on a given date.
- * Supports fuzzy matching on station names.
+ * Resolve free text to a location filter.
+ *   1. exact branch code       → that branch
+ *   2. exact city (any case)   → every branch in the city
+ *   3. completion suggester    → best branch (handles typos)
+ *   4. fuzzy name/city match   → best branch
  */
-const searchTrains = async (from, to, date) => {
-     const fromStation = await resolveStation(from);
-     const toStation = await resolveStation(to);
-
-     if (!fromStation) return { trains: [], message: `Station "${from}" not found` };
-     if (!toStation) return { trains: [], message: `Station "${to}" not found` };
-
-     const query = {
-          bool: {
-               must: [
-                    {
-                         nested: {
-                              path: 'route',
-                              query: { term: { 'route.stationId': fromStation.stationId } },
-                              inner_hits: { name: 'from_station' },
-                         },
-                    },
-                    {
-                         nested: {
-                              path: 'route',
-                              query: { term: { 'route.stationId': toStation.stationId } },
-                              inner_hits: { name: 'to_station' },
-                         },
-                    },
-               ],
-          },
-     };
-
-     const result = await esClient.search({
-          index: TRAIN_INDEX,
-          query,
-          size: 50,
-     });
-
-     const normalize = (d) => new Date(d).toISOString().slice(0, 10);
-
-     const trains = result.hits.hits
-          .map((hit) => {
-               const src = hit._source;
-               const fromHit = hit.inner_hits.from_station.hits.hits[0]?._source;
-               const toHit = hit.inner_hits.to_station.hits.hits[0]?._source;
-
-               if (!fromHit || !toHit || fromHit.sequenceNumber >= toHit.sequenceNumber) {
-                    return null;
-               }
-
-               let scheduleInfo = null;
-               if (date && src.schedules && src.schedules.length > 0) {
-                    scheduleInfo = src.schedules.find(
-                         (s) => s.status === 'ACTIVE' && normalize(s.departureDate) === date
-                    ) || null;
-               }
-
-               return {
-                    trainId: src.trainId,
-                    trainNumber: src.trainNumber,
-                    trainName: src.trainName,
-                    // --- SEGMENT BOOKING: Added stationId and sequenceNumber to from/to for segment-aware booking ---
-                    from: { name: fromHit.stationName, code: fromHit.stationCode, departure: fromHit.departureTime, stationId: fromHit.stationId, sequenceNumber: fromHit.sequenceNumber },
-                    to: { name: toHit.stationName, code: toHit.stationCode, arrival: toHit.arrivalTime, stationId: toHit.stationId, sequenceNumber: toHit.sequenceNumber },
-                    seatSummary: src.seatSummary,
-                    schedule: scheduleInfo,
-               };
-          })
-          .filter(Boolean);
-
-     return {
-          from: { resolved: fromStation.name, code: fromStation.code },
-          to: { resolved: toStation.name, code: toStation.code },
-          date: date || 'any',
-          count: trains.length,
-          trains,
-     };
+// Former / colloquial city names → the name branches are registered under.
+// Too far apart for fuzzy matching (e.g. "Bangalore" vs "Bengaluru").
+const CITY_ALIASES = {
+     bangalore: 'Bengaluru',
+     banglore: 'Bengaluru',
+     blr: 'Bengaluru',
+     bombay: 'Mumbai',
+     madras: 'Chennai',
+     calcutta: 'Kolkata',
+     gurgaon: 'Gurugram',
+     trivandrum: 'Thiruvananthapuram',
+     vizag: 'Visakhapatnam',
+     hyd: 'Hyderabad',
 };
 
-/**
- * Fuzzy-resolve a station name/code to its ID.
- * Three strategies: exact code → completion suggester → fuzzy match
- */
-const resolveStation = async (input) => {
-     // 1. Try exact code match
-     const exactResult = await esClient.search({
-          index: STATION_INDEX,
+const resolveLocation = async (rawInput) => {
+     const input = CITY_ALIASES[rawInput.trim().toLowerCase()] || rawInput.trim();
+
+     const exactCode = await esClient.search({
+          index: BRANCH_INDEX,
           query: { term: { code: input.toUpperCase() } },
           size: 1,
      });
-     if (exactResult.hits.hits.length > 0) return exactResult.hits.hits[0]._source;
+     if (exactCode.hits.hits.length > 0) {
+          const b = exactCode.hits.hits[0]._source;
+          return { type: 'branch', branchId: b.branchId, label: `${b.name}, ${b.city}` };
+     }
 
-     // 2. Try completion suggester (handles typos like "dehli" → "Delhi")
+     const cityHit = await esClient.search({
+          index: BRANCH_INDEX,
+          query: { term: { 'city.kw': input.trim().toLowerCase() } },
+          size: 1,
+     });
+     if (cityHit.hits.hits.length > 0) {
+          const city = cityHit.hits.hits[0]._source.city;
+          return { type: 'city', city, label: city };
+     }
+
      try {
           const suggestResult = await esClient.search({
-               index: STATION_INDEX,
+               index: BRANCH_INDEX,
                suggest: {
-                    station_suggest: {
+                    branch_suggest: {
                          prefix: input,
-                         completion: {
-                              field: 'suggest',
-                              fuzzy: { fuzziness: 'AUTO' },
-                              size: 1,
-                         },
+                         completion: { field: 'suggest', fuzzy: { fuzziness: 'AUTO' }, size: 1 },
                     },
                },
           });
-          const options = suggestResult.suggest?.station_suggest?.[0]?.options || [];
-          if (options.length > 0) return options[0]._source;
+          const option = suggestResult.suggest?.branch_suggest?.[0]?.options?.[0];
+          if (option) {
+               const b = option._source;
+               return { type: 'branch', branchId: b.branchId, label: `${b.name}, ${b.city}` };
+          }
      } catch (err) {
           logger.warn(`Suggest fallback failed: ${err.message}`);
      }
 
-     // 3. Fuzzy match on name
-     const fuzzyResult = await esClient.search({
-          index: STATION_INDEX,
+     const fuzzy = await esClient.search({
+          index: BRANCH_INDEX,
           query: {
-               multi_match: {
-                    query: input,
-                    fields: ['name', 'city'],
-                    fuzziness: 'AUTO',
-                    prefix_length: 1,
-               },
+               multi_match: { query: input, fields: ['name', 'city'], fuzziness: 'AUTO', prefix_length: 1 },
           },
           size: 1,
      });
+     if (fuzzy.hits.hits.length > 0) {
+          const b = fuzzy.hits.hits[0]._source;
+          return { type: 'branch', branchId: b.branchId, label: `${b.name}, ${b.city}` };
+     }
 
-     return fuzzyResult.hits.hits.length > 0 ? fuzzyResult.hits.hits[0]._source : null;
+     return null;
+};
+
+const estimatePrice = (dailyRate, pickup, dropoff) => {
+     const hours = (dropoff.getTime() - pickup.getTime()) / 3600000 - GRACE_MINUTES / 60;
+     const rentalDays = Math.max(1, Math.ceil(hours / 24));
+     const base = Math.round(rentalDays * dailyRate);
+     const discount = rentalDays >= LONG_RENTAL_MIN_DAYS ? Math.round(base * LONG_RENTAL_DISCOUNT_PCT / 100) : 0;
+     return { rentalDays, estimatedTotal: base - discount };
+};
+
+const SORTS = {
+     price_asc: [{ dailyRate: 'asc' }],
+     price_desc: [{ dailyRate: 'desc' }],
+     newest: [{ year: 'desc' }, { dailyRate: 'asc' }],
+     seats: [{ seats: 'desc' }, { dailyRate: 'asc' }],
 };
 
 /**
- * Autocomplete station names as user types.
+ * Find cars at a location that are free for the whole [pickupAt, dropoffAt) window.
  */
-const autocompleteStation = async (prefix) => {
+const searchCars = async ({ location, pickupAt, dropoffAt, category, transmission, fuelType, minSeats, maxPrice, sort }) => {
+     const resolved = await resolveLocation(location);
+     if (!resolved) {
+          return { cars: [], count: 0, message: `No branch found for "${location}"` };
+     }
+
+     const filter = [{ term: { status: 'ACTIVE' } }];
+     if (resolved.type === 'branch') filter.push({ term: { 'branch.branchId': resolved.branchId } });
+     if (resolved.type === 'city') filter.push({ term: { 'branch.city': resolved.city } });
+     if (category) filter.push({ terms: { category: String(category).toUpperCase().split(',') } });
+     if (transmission) filter.push({ term: { transmission: String(transmission).toUpperCase() } });
+     if (fuelType) filter.push({ terms: { fuelType: String(fuelType).toUpperCase().split(',') } });
+     if (minSeats) filter.push({ range: { seats: { gte: Number(minSeats) } } });
+     if (maxPrice) filter.push({ range: { dailyRate: { lte: Number(maxPrice) } } });
+
+     const mustNot = [];
+     let pickup = null;
+     let dropoff = null;
+     if (pickupAt && dropoffAt) {
+          pickup = new Date(pickupAt);
+          dropoff = new Date(dropoffAt);
+          // Exclude cars with any booked/held interval intersecting the requested window
+          mustNot.push({
+               range: {
+                    blockedRanges: {
+                         gte: pickup.toISOString(),
+                         lt: dropoff.toISOString(),
+                         relation: 'intersects',
+                    },
+               },
+          });
+     }
+
      const result = await esClient.search({
-          index: STATION_INDEX,
-          suggest: {
-               station_suggest: {
-                    prefix,
-                    completion: {
-                         field: 'suggest',
-                         fuzzy: { fuzziness: 'AUTO' },
-                         size: 10,
+          index: CAR_INDEX,
+          query: { bool: { filter, must_not: mustNot } },
+          sort: SORTS[sort] || SORTS.price_asc,
+          size: 100,
+          aggs: {
+               categories: { terms: { field: 'category' } },
+               transmissions: { terms: { field: 'transmission' } },
+               fuelTypes: { terms: { field: 'fuelType' } },
+               priceRange: { stats: { field: 'dailyRate' } },
+          },
+     });
+
+     const cars = result.hits.hits.map((hit) => {
+          const c = hit._source;
+          return {
+               carId: c.carId,
+               make: c.make,
+               model: c.model,
+               year: c.year,
+               category: c.category,
+               transmission: c.transmission,
+               fuelType: c.fuelType,
+               seats: c.seats,
+               dailyRate: c.dailyRate,
+               imageUrl: c.imageUrl,
+               branch: c.branch,
+               ...(pickup && dropoff ? estimatePrice(c.dailyRate, pickup, dropoff) : {}),
+          };
+     });
+
+     const bucketMap = (agg) => Object.fromEntries((agg?.buckets || []).map((b) => [b.key, b.doc_count]));
+
+     return {
+          location: resolved.label,
+          pickupAt: pickup,
+          dropoffAt: dropoff,
+          count: cars.length,
+          cars,
+          facets: {
+               category: bucketMap(result.aggregations?.categories),
+               transmission: bucketMap(result.aggregations?.transmissions),
+               fuelType: bucketMap(result.aggregations?.fuelTypes),
+               price: {
+                    min: result.aggregations?.priceRange?.min ?? null,
+                    max: result.aggregations?.priceRange?.max ?? null,
+               },
+          },
+     };
+};
+
+/**
+ * Cities with active cars — powers the "popular locations" shortcuts.
+ */
+const getLocations = async () => {
+     const result = await esClient.search({
+          index: CAR_INDEX,
+          size: 0,
+          query: { term: { status: 'ACTIVE' } },
+          aggs: {
+               cities: {
+                    terms: { field: 'branch.city', size: 50, order: { _count: 'desc' } },
+                    aggs: {
+                         fromPrice: { min: { field: 'dailyRate' } },
+                         branches: { cardinality: { field: 'branch.branchId' } },
+                         sample: { top_hits: { size: 1, _source: ['branch.city'] } },
                     },
                },
           },
      });
 
-     const options = result.suggest.station_suggest[0]?.options || [];
-     return options.map((o) => ({
-          name: o._source.name,
-          code: o._source.code,
-          stationId: o._source.stationId,
+     return (result.aggregations?.cities?.buckets || []).map((b) => ({
+          city: b.sample.hits.hits[0]?._source?.branch?.city || b.key,
+          cars: b.doc_count,
+          branches: b.branches.value,
+          fromPrice: b.fromPrice.value,
      }));
 };
 
 /**
- * Debug: get all indexed stations
+ * Autocomplete pickup locations (branches) as the user types.
  */
-const getAllStations = async () => {
+const autocompleteBranch = async (prefix) => {
      const result = await esClient.search({
-          index: STATION_INDEX,
-          query: { match_all: {} },
-          size: 100,
+          index: BRANCH_INDEX,
+          suggest: {
+               branch_suggest: {
+                    prefix,
+                    completion: { field: 'suggest', fuzzy: { fuzziness: 'AUTO' }, size: 10 },
+               },
+          },
      });
+
+     const options = result.suggest.branch_suggest[0]?.options || [];
+     return options.map((o) => ({
+          branchId: o._source.branchId,
+          name: o._source.name,
+          code: o._source.code,
+          city: o._source.city,
+     }));
+};
+
+/**
+ * Debug: get all indexed branches
+ */
+const getAllBranches = async () => {
+     const result = await esClient.search({ index: BRANCH_INDEX, query: { match_all: {} }, size: 100 });
      return result.hits.hits.map((h) => h._source);
 };
 
 /**
- * Debug: get all indexed trains
+ * Debug: get all indexed cars
  */
-const getAllTrains = async () => {
-     const result = await esClient.search({
-          index: TRAIN_INDEX,
-          query: { match_all: {} },
-          size: 100,
-     });
+const getAllCars = async () => {
+     const result = await esClient.search({ index: CAR_INDEX, query: { match_all: {} }, size: 100 });
      return result.hits.hits.map((h) => h._source);
 };
 
 module.exports = {
-     indexStation,
-     indexTrainRoute,
-     indexSchedule,
-     cancelSchedule,
-     updateSeatAvailability,
-     searchTrains,
-     autocompleteStation,
-     getAllStations,
-     getAllTrains,
+     indexBranch,
+     upsertCar,
+     updateCarStatus,
+     updateCarAvailability,
+     searchCars,
+     resolveLocation,
+     autocompleteBranch,
+     getLocations,
+     getAllBranches,
+     getAllCars,
 };

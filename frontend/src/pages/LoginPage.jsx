@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuthStore } from '../store/auth.store';
 import { authApi } from '../api/auth.api';
@@ -24,6 +24,14 @@ export default function LoginPage() {
 
   // OTP form
   const [otp, setOtp] = useState('');
+  const [resendIn, setResendIn] = useState(0);
+
+  // Cooldown ticker for "Resend code"
+  useEffect(() => {
+    if (resendIn <= 0) return;
+    const t = setTimeout(() => setResendIn((s) => s - 1), 1000);
+    return () => clearTimeout(t);
+  }, [resendIn]);
 
   const redirect = searchParams.get('redirect') || '/';
 
@@ -56,10 +64,23 @@ export default function LoginPage() {
       await authApi.sendOtp(regData);
       showToast('OTP sent to your email!', 'success');
       setTab('otp');
+      setResendIn(30);
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleResend = async () => {
+    setError('');
+    try {
+      await authApi.sendOtp(regData);
+      showToast('A new code is on its way', 'success');
+      setOtp('');
+      setResendIn(60);
+    } catch (err) {
+      setError(err.message);
     }
   };
 
@@ -80,11 +101,22 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-[80vh] flex items-center justify-center px-4 py-12">
-      <div className="w-full max-w-md">
+    <div className="min-h-[85vh] grid lg:grid-cols-2">
+      {/* Photo panel (desktop) */}
+      <div className="hidden lg:block relative overflow-hidden">
+        <img src="/cars/mercedes-benz-c-class.jpg" alt="" className="absolute inset-0 h-full w-full object-cover scale-105 animate-fade-in" />
+        <div className="absolute inset-0 bg-gradient-to-t from-primary-950/90 via-primary-900/40 to-transparent" />
+        <div className="absolute bottom-10 left-10 right-10 text-white animate-fade-in-up" style={{ animationDelay: '200ms' }}>
+          <p className="text-3xl font-extrabold leading-tight">Your next road trip<br />starts here.</p>
+          <p className="text-primary-100 mt-2">Hatchbacks, SUVs and luxury cars — by the day, with free cancellation.</p>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-center px-4 py-12">
+      <div className="w-full max-w-md animate-fade-in-up">
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-primary-900">Welcome to IRCTC</h1>
-          <p className="text-gray-500 mt-2">Book train tickets seamlessly</p>
+          <h1 className="text-3xl font-bold text-primary-900 dark:text-primary-200">Welcome to <span className="whitespace-nowrap">SR-CarRentals</span></h1>
+          <p className="text-gray-500 dark:text-gray-400 mt-2">Log in to book self-drive cars</p>
         </div>
 
         <div className="card">
@@ -94,7 +126,7 @@ export default function LoginPage() {
               <button
                 onClick={() => { setTab('login'); setError(''); }}
                 className={`flex-1 pb-3 text-sm font-semibold border-b-2 transition-colors ${
-                  tab === 'login' ? 'border-primary-900 text-primary-900' : 'border-transparent text-gray-400 hover:text-gray-600'
+                  tab === 'login' ? 'border-primary-900 text-primary-900 dark:text-primary-200' : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
                 }`}
               >
                 Login
@@ -102,7 +134,7 @@ export default function LoginPage() {
               <button
                 onClick={() => { setTab('register'); setError(''); }}
                 className={`flex-1 pb-3 text-sm font-semibold border-b-2 transition-colors ${
-                  tab === 'register' ? 'border-primary-900 text-primary-900' : 'border-transparent text-gray-400 hover:text-gray-600'
+                  tab === 'register' ? 'border-primary-900 text-primary-900 dark:text-primary-200' : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
                 }`}
               >
                 Register
@@ -111,7 +143,7 @@ export default function LoginPage() {
           )}
 
           {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3 mb-4">
+            <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 text-red-700 dark:text-red-300 text-sm rounded-lg px-4 py-3 mb-4">
               {error}
             </div>
           )}
@@ -142,17 +174,29 @@ export default function LoginPage() {
           {/* OTP Form */}
           {tab === 'otp' && (
             <form onSubmit={handleVerifyOtp} className="space-y-4">
-              <p className="text-sm text-gray-600 mb-2">
+              <p className="text-sm text-gray-600 dark:text-gray-300 mb-2">
                 We've sent a verification code to <strong>{regData.email}</strong>
               </p>
-              <Input label="OTP Code" value={otp} onChange={(e) => setOtp(e.target.value)} placeholder="Enter 6-digit OTP" maxLength={6} required />
+              <Input label="OTP Code" value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))} placeholder="Enter 6-digit OTP" maxLength={6} inputMode="numeric" autoComplete="one-time-code" required />
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Didn't get it? Check your spam/promotions folder — the code is valid for 5 minutes.
+              </p>
               <Button type="submit" loading={loading} className="w-full">Verify OTP</Button>
-              <button type="button" onClick={() => setTab('register')} className="text-sm text-primary-700 hover:underline w-full text-center">
+              <button
+                type="button"
+                onClick={handleResend}
+                disabled={resendIn > 0}
+                className="text-sm text-primary-700 dark:text-primary-400 hover:underline w-full text-center disabled:text-gray-400 disabled:no-underline"
+              >
+                {resendIn > 0 ? `Resend code in ${resendIn}s` : 'Resend code'}
+              </button>
+              <button type="button" onClick={() => setTab('register')} className="text-sm text-primary-700 dark:text-primary-400 hover:underline w-full text-center">
                 Back to register
               </button>
             </form>
           )}
         </div>
+      </div>
       </div>
     </div>
   );

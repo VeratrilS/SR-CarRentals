@@ -13,7 +13,7 @@ const kafka = new Kafka({
      },
 });
 
-// Producer (for publishing SEAT_AVAILABILITY_UPDATED)
+// Producer (for publishing CAR_AVAILABILITY_UPDATED)
 const producer = kafka.producer({
      allowAutoTopicCreation: true,
      transactionTimeout: 30000,
@@ -42,7 +42,7 @@ const disconnectProducer = async () => {
      }
 };
 
-// Consumer (for SCHEDULE_CREATED, SCHEDULE_CANCELLED)
+// Consumer (for CAR_CREATED, CAR_UPDATED, CAR_STATUS_CHANGED)
 const consumer = kafka.consumer({
      groupId: 'inventory-service-group',
      sessionTimeout: 30000,

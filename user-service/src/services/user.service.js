@@ -2,6 +2,7 @@ const { config } = require("../config");
 const {redis} = require("../config/redis");
 const prisma = require('../config/prisma');
 const logger = require('../config/logger');
+const {roleFor} = require('../utils/auth');
 
 
 
@@ -11,7 +12,8 @@ const getProfile = async(userId) =>{
      const storedUser = await redis.get(`user:${userId}`);
      if(storedUser){
           logger.info("Fetched user profile from redis");
-          return JSON.parse(storedUser);
+          const cached = JSON.parse(storedUser);
+          return {...cached, role: roleFor(cached.email)};
      }
      logger.info("If user is not in redis, fetch user from DB");
      const userProfile = await prisma.user.findUnique({
@@ -24,7 +26,7 @@ const getProfile = async(userId) =>{
      const {password: _password, ...safeUser} = userProfile;
      logger.info("Store user profile in redis for future lookups");
      await redis.set(`user:${userId}`, JSON.stringify(safeUser), 'EX', config.REDIS_USER_TTL);
-     return safeUser;
+     return {...safeUser, role: roleFor(safeUser.email)};
 }
 
 module.exports = {getProfile}

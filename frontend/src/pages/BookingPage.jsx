@@ -1,50 +1,89 @@
-import { useEffect, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
-import { useBookingStore } from '../store/booking.store';
+import { bookingApi } from '../api/booking.api';
 import BookingSummary from '../components/booking/BookingSummary';
-import PassengerList from '../components/booking/PassengerList';
+import DriverForm from '../components/booking/DriverForm';
 import PaymentButton from '../components/booking/PaymentButton';
+import Spinner from '../components/ui/Spinner';
+import ErrorState from '../components/ui/ErrorState';
+import { FREE_CANCELLATION_HOURS } from '../utils/constants';
 
+/**
+ * /book/:carId?pickupAt=…&dropoffAt=…
+ * Everything needed is in the URL, so the page survives a refresh or a login redirect.
+ */
 export default function BookingPage() {
-  const navigate = useNavigate();
-  const selectedTrain = useBookingStore((s) => s.selectedTrain);
-  const selectedSeats = useBookingStore((s) => s.selectedSeats);
-  const scheduleId = useBookingStore((s) => s.scheduleId);
+  const { carId } = useParams();
+  const [searchParams] = useSearchParams();
+  const pickupAt = searchParams.get('pickupAt');
+  const dropoffAt = searchParams.get('dropoffAt');
 
-  const seats = useMemo(() => Array.from(selectedSeats.values()), [selectedSeats]);
-  const seatIds = useMemo(() => seats.map((s) => s.seatId), [seats]);
-  const totalPrice = useMemo(() => seats.reduce((sum, s) => sum + (s.price || 0), 0), [seats]);
+  const [quote, setQuote] = useState(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
 
-  const { register, handleSubmit, formState: { errors, isValid }, getValues } = useForm({
-    mode: 'onChange',
-  });
+  const { register, formState: { errors, isValid }, getValues } = useForm({ mode: 'onChange' });
 
-  useEffect(() => {
-    if (seats.length === 0) {
-      navigate('/search');
+  const loadQuote = () => {
+    if (!pickupAt || !dropoffAt) {
+      setError('Missing rental dates — please search again.');
+      setLoading(false);
+      return;
     }
-  }, [seats.length, navigate]);
+    setLoading(true);
+    setError('');
+    bookingApi.quote(carId, pickupAt, dropoffAt)
+      .then((res) => setQuote(res.data || res))
+      .catch((err) => setError(err.message || 'Could not load this car'))
+      .finally(() => setLoading(false));
+  };
 
-  if (seats.length === 0) return null;
+  useEffect(loadQuote, [carId, pickupAt, dropoffAt]);
+
+  if (loading) {
+    return <div className="flex justify-center py-20"><Spinner size="lg" /></div>;
+  }
+
+  if (error) {
+    return (
+      <div className="max-w-3xl mx-auto px-4 py-12">
+        <ErrorState title="Couldn't load this car" message={error} onRetry={pickupAt && dropoffAt ? loadQuote : undefined} />
+        <p className="text-center mt-4"><Link to="/search" className="text-sm text-primary-700 dark:text-primary-400 hover:underline">← Back to search</Link></p>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
-      <h1 className="text-2xl font-bold mb-6">Complete Your Booking</h1>
+      <Link to="/search" className="text-sm text-primary-700 dark:text-primary-400 hover:underline">← Back to results</Link>
+      <h1 className="text-2xl font-bold mt-2 mb-6">Complete your booking</h1>
 
-      <BookingSummary train={selectedTrain} seats={seats} totalPrice={totalPrice} />
+      {!quote.available && (
+        <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-200 rounded-lg p-4 mb-6 text-sm">
+          This car was just reserved by someone else for part of these dates. Please pick another car or change your dates.
+        </div>
+      )}
+
+      <BookingSummary data={quote} />
 
       <div className="card mb-6">
-        <form id="passenger-form" onSubmit={handleSubmit(() => {})}>
-          <PassengerList seats={seats} register={register} errors={errors} />
+        <form onSubmit={(e) => e.preventDefault()}>
+          <DriverForm register={register} errors={errors} minAge={quote.minDriverAge} />
         </form>
       </div>
 
+      <p className="text-xs text-gray-500 dark:text-gray-400 mb-3 text-center">
+        Free cancellation up to {FREE_CANCELLATION_HOURS} hours before pickup · 50% refund after that, until pickup.
+      </p>
+
       <PaymentButton
-        passengers={getValues('passengers') || []}
-        scheduleId={scheduleId}
-        seatIds={seatIds}
-        disabled={!isValid}
+        carId={carId}
+        pickupAt={pickupAt}
+        dropoffAt={dropoffAt}
+        getDriver={() => getValues('driver')}
+        amount={quote.totalAmount}
+        disabled={!isValid || !quote.available}
       />
     </div>
   );

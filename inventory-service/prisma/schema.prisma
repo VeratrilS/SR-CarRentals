@@ -6,104 +6,113 @@ datasource db {
   provider = "postgresql"
 }
 
-enum SeatStatus {
-  AVAILABLE
-  LOCKED
-  BOOKED
-  CANCELLED
+enum HoldStatus {
+  LOCKED // temporarily held while the customer pays (expires)
+  BOOKED // confirmed rental
 }
 
-model ScheduleInventory {
-  id            String   @id @default(uuid())
-  scheduleId    String   @unique
-  trainId       String
-  trainNumber   String
-  trainName     String
-  departureDate DateTime @db.Date
-  totalSeats    Int
-  available     Int
-  locked        Int      @default(0)
-  booked        Int      @default(0)
-  status        String   @default("ACTIVE")
-  version       Int      @default(0)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+// Read model of a fleet car, built from admin CAR_CREATED / CAR_UPDATED events
+model CarInventory {
+  id                 String   @id @default(uuid())
+  carId              String   @unique
+  registrationNumber String
+  make               String
+  model              String
+  category           String
+  transmission       String
+  fuelType           String
+  seats              Int
+  dailyRate          Float
+  branchId           String
+  branchCode         String
+  branchName         String
+  city               String
+  status             String   @default("ACTIVE")
+  version            Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
-  seats SeatInventory[]
+  holds RentalHold[]
 
-  @@index([trainId])
-  @@index([scheduleId, status])
-  @@index([departureDate])
-  @@map("schedule_inventories")
+  @@index([branchId, status])
+  @@map("car_inventories")
 }
 
-model SeatInventory {
-  id                  String     @id @default(uuid())
-  scheduleInventoryId String
-  scheduleId          String
-  seatId              String
-  seatNumber          Int
-  seatType            String
-  price               Float
-  status              SeatStatus @default(AVAILABLE)
-  lockedBy            String?
-  lockedAt            DateTime?
-  lockExpiresAt       DateTime?
-  bookingId           String?
-  version             Int        @default(0)
-  createdAt           DateTime   @default(now())
-  updatedAt           DateTime   @updatedAt
-
-  scheduleInventory ScheduleInventory @relation(fields: [scheduleInventoryId], references: [id], onDelete: Cascade)
-
-  @@unique([scheduleId, seatId])
-  @@unique([scheduleId, seatNumber])
-  @@index([scheduleId, status])
-  @@index([lockExpiresAt, status])
-  @@index([bookingId])
-  @@map("seat_inventories")
-}
-
-// --- SEGMENT BOOKING: Route topology per schedule ---
-// Stores the ordered list of stations for each schedule, populated from SCHEDULE_CREATED event.
-// Used to resolve station IDs to sequence numbers for segment overlap checks.
-model RouteStop {
-  id             String @id @default(uuid())
-  scheduleId     String
-  stationId      String
-  stationName    String
-  stationCode    String
-  sequenceNumber Int
-
-  @@unique([scheduleId, stationId])
-  @@unique([scheduleId, sequenceNumber])
-  @@index([scheduleId])
-  @@map("route_stops")
-}
-
-// --- SEGMENT BOOKING: Per-segment seat lock/booking tracking ---
-// Each row represents a seat locked or booked for a specific segment [fromSeq, toSeq).
-// Two segments overlap if: a.fromSeq < b.toSeq AND b.fromSeq < a.toSeq
-model SeatSegmentLock {
+// A car reserved for the half-open interval [startAt, endAt).
+// Two holds on the same car conflict iff a.startAt < b.endAt AND b.startAt < a.endAt.
+// A Postgres EXCLUSION constraint (see src/config/dbConstraints.js) enforces this at
+// the database level as a last line of defence against double booking.
+model RentalHold {
   id            String     @id @default(uuid())
-  scheduleId    String
-  seatId        String
-  fromSeq       Int        // sequenceNumber of boarding station
-  toSeq         Int        // sequenceNumber of alighting station
-  status        SeatStatus @default(LOCKED)
-  lockedBy      String?
-  lockedAt      DateTime?
+  carId         String
+  bookingId     String     @unique
+  startAt       DateTime
+  endAt         DateTime
+  status        HoldStatus @default(LOCKED)
+  lockedBy      String
+  lockedAt      DateTime   @default(now())
   lockExpiresAt DateTime?
-  bookingId     String?
   version       Int        @default(0)
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
 
-  @@index([scheduleId, seatId])
-  @@index([scheduleId, seatId, status])
+  car CarInventory @relation(fields: [carId], references: [carId], onDelete: Cascade)
+
+  @@index([carId, status])
+  @@index([carId, startAt, endAt])
   @@index([lockExpiresAt, status])
+  @@map("rental_holds")
+}
+
+// ─── Shared rides ─────────────────────────────────────────────────────────────
+
+// Read model of a scheduled trip, built from admin TRIP_SCHEDULED events
+model TripInventory {
+  id             String   @id @default(uuid())
+  tripId         String   @unique
+  carId          String
+  routeName      String
+  departureAt    DateTime
+  arrivalAt      DateTime
+  status         String   @default("SCHEDULED")
+  passengerSeats Int
+  farePerKm      Float
+  driverName     String
+  stops          Json // [{ sequence, branchId, name, code, city, distanceKm, time }]
+  car            Json // { carId, make, model, registrationNumber, category, seats, imageUrl }
+  version        Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  seatHolds TripSeatHold[]
+
+  @@index([departureAt, status])
+  @@map("trip_inventories")
+}
+
+// One seat on one trip, held for the stops [fromSeq, toSeq).
+// Same seat, overlapping stretches conflict: a.fromSeq < b.toSeq AND b.fromSeq < a.toSeq.
+// Enforced at the database level by an EXCLUSION constraint (see src/config/dbConstraints.js).
+model TripSeatHold {
+  id            String     @id @default(uuid())
+  tripId        String
+  seatNumber    Int
+  fromSeq       Int
+  toSeq         Int
+  status        HoldStatus @default(LOCKED)
+  bookingId     String
+  lockedBy      String
+  lockedAt      DateTime   @default(now())
+  lockExpiresAt DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  trip TripInventory @relation(fields: [tripId], references: [tripId], onDelete: Cascade)
+
+  @@index([tripId, seatNumber])
   @@index([bookingId])
-  @@map("seat_segment_locks")
+  @@index([lockExpiresAt, status])
+  @@map("trip_seat_holds")
 }
 
 model IdempotencyRecord {

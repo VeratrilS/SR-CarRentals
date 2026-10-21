@@ -30,6 +30,15 @@ const config = {
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
 
   INTERNAL_SERVICE_KEY: process.env.INTERNAL_SERVICE_KEY,
+
+  // Dev convenience: also print OTPs to the log (ignored when NODE_ENV=production)
+  LOG_OTP_IN_DEV: process.env.LOG_OTP_IN_DEV === 'true',
+
+  // Comma-separated list of emails that get the ADMIN role
+  ADMIN_EMAILS: (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean),
 }
 
 

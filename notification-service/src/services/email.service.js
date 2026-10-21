@@ -2,9 +2,9 @@ const sgMail = require('@sendgrid/mail');
 const logger = require('../config/logger');
 const { config } = require('../config');
 const {
+     BRAND,
      getOtpTemplate,
      getWelcomeTemplate,
-     getTicketConfirmationTemplate,
      getBookingConfirmedTemplate,
      getBookingFailedTemplate,
      getBookingCancelledTemplate,
@@ -14,7 +14,7 @@ sgMail.setApiKey(config.SENDGRID_API_KEY);
 
 class EmailService {
      constructor() {
-          this.from = config.MAIL_SEND
+          this.from = { email: config.MAIL_SEND, name: BRAND };
           this.maxRetries = 3;
      }
 
@@ -47,7 +47,7 @@ class EmailService {
           const msg = {
                to: email,
                from: this.from,
-               subject: 'Your DesignKarle verification code',
+               subject: `Your ${BRAND} verification code`,
                html: getOtpTemplate(otp, ttlMinutes),
           };
 
@@ -58,7 +58,7 @@ class EmailService {
           const msg = {
                to: email,
                from: this.from,
-               subject: 'Welcome to DesignKarle - Email Verified',
+               subject: `Welcome to ${BRAND} - Email Verified`,
                html: getWelcomeTemplate(firstName),
           };
 
@@ -69,7 +69,9 @@ class EmailService {
           const msg = {
                to: email,
                from: this.from,
-               subject: `Booking Confirmed - ${bookingData.trainName || 'Your Train Ticket'}`,
+               subject: bookingData.type === 'SEAT'
+                    ? `Seats Confirmed - ${bookingData.fromStopName} → ${bookingData.toStopName} | ${BRAND}`
+                    : `Booking Confirmed - ${bookingData.carName || 'Your Rental'} | ${BRAND}`,
                html: getBookingConfirmedTemplate(bookingData),
           };
 
@@ -80,7 +82,7 @@ class EmailService {
           const msg = {
                to: email,
                from: this.from,
-               subject: 'Booking Unsuccessful - Please Try Again',
+               subject: `Booking Unsuccessful - Please Try Again | ${BRAND}`,
                html: getBookingFailedTemplate(bookingData),
           };
 
@@ -91,7 +93,7 @@ class EmailService {
           const msg = {
                to: email,
                from: this.from,
-               subject: 'Booking Cancelled - Refund Update',
+               subject: `Booking Cancelled - Refund Update | ${BRAND}`,
                html: getBookingCancelledTemplate(bookingData),
           };
 

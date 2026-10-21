@@ -45,12 +45,14 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: config.SERVIC
 app.use(errorHandler);
 
 const startServer = async () => {
-     if (process.env.ES_RECREATE_INDICES === 'true') {
+     // Recreating indices also replays Kafka history, otherwise the new indices stay empty
+     const recreate = process.env.ES_RECREATE_INDICES === 'true';
+     if (recreate) {
           await recreateIndices();
      } else {
           await initIndices();
      }
-     await searchConsumer.start();
+     await searchConsumer.start({ replay: recreate });
 
      const server = app.listen(config.PORT, () => {
           logger.info(`${config.SERVICE_NAME} running on http://localhost:${config.PORT}`);

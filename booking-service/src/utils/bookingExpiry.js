@@ -2,7 +2,7 @@ const prisma = require('../config/prisma');
 const logger = require('../config/logger');
 const { config } = require('../config');
 const { redis } = require('../config/redis');
-const { forceReleaseSeatLocks } = require('./distributedLock');
+const { forceReleaseBookingLock } = require('./distributedLock');
 const { compensateAll } = require('../services/saga.service');
 const { userClient } = require('../services/userClient');
 const bookingProducer = require('../kafka/producer/booking.producer');
@@ -48,7 +48,7 @@ async function tryAcquireLeadership() {
  * Uses Redis leader election so only ONE instance across all replicas
  * runs the cleanup each cycle, avoiding redundant DB scans.
  *
- * Finds bookings in PENDING / SEATS_HELD / PAYMENT_PENDING
+ * Finds bookings in PENDING / CAR_HELD / PAYMENT_PENDING
  * where lockExpiresAt < now, compensates all saga steps,
  * and marks them as EXPIRED.
  */
@@ -63,10 +63,9 @@ async function cleanExpiredBookings() {
      try {
           const expiredBookings = await prisma.booking.findMany({
                where: {
-                    status: { in: ['PENDING', 'SEATS_HELD', 'PAYMENT_PENDING'] },
+                    status: { in: ['PENDING', 'CAR_HELD', 'PAYMENT_PENDING'] },
                     lockExpiresAt: { lt: new Date() },
                },
-               include: { seats: true },
           });
 
           if (expiredBookings.length === 0) return;
@@ -75,15 +74,13 @@ async function cleanExpiredBookings() {
 
           for (const booking of expiredBookings) {
                try {
-                    const seatIds = booking.seats.map(s => s.seatId).sort();
-
                     // Atomically claim this booking via optimistic lock (CAS).
                     // If payment webhook or user cancel already changed the version, skip it.
                     const claimed = await prisma.booking.updateMany({
                          where: {
                               id: booking.id,
                               version: booking.version,
-                              status: { in: ['PENDING', 'SEATS_HELD', 'PAYMENT_PENDING'] },
+                              status: { in: ['PENDING', 'CAR_HELD', 'PAYMENT_PENDING'] },
                          },
                          data: {
                               status: 'EXPIRED',
@@ -98,10 +95,10 @@ async function cleanExpiredBookings() {
                     }
 
                     // Compensate all completed saga steps
-                    await compensateAll(booking, seatIds);
+                    await compensateAll(booking);
 
-                    // Release Redis locks (segment-aware)
-                    await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+                    // Release Redis lock(s) for this car window / these seats
+                    await forceReleaseBookingLock(booking);
 
                     // Publish BOOKING_FAILED
                     try {
@@ -111,7 +108,7 @@ async function cleanExpiredBookings() {
                               userId: booking.userId,
                               email: userInfo.email,
                               firstName: userInfo.firstName,
-                              scheduleId: booking.scheduleId,
+                              carName: booking.carName,
                               reason: 'booking_timeout',
                          });
                     } catch (err) {

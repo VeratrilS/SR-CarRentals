@@ -1,5 +1,5 @@
 # ==========================================
-# IRCTC Backend - Git Ignore Configuration
+# SR-CarRentals - Git Ignore Configuration
 # ==========================================
 
 # ============ Environment Variables ============
@@ -165,5 +165,6 @@ serviceAccountKey.json
 # Add service-specific ignores here if needed
 # user-service/uploads/
 # booking-service/temp/
-README.md
-docker-compose.yml
+
+# Personal coursework (kept out of the repo)
+Lab_Embeddings/

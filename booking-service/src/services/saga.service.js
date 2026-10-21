@@ -1,165 +1,96 @@
 const prisma = require('../config/prisma');
 const logger = require('../config/logger');
-const { inventoryClient } = require('./inventoryClient');
 const { paymentClient } = require('./paymentClient');
+const holds = require('./holds');
 
 /**
- * Saga orchestrator for booking lifecycle.
+ * Saga orchestrator for the booking lifecycle (rentals and seat bookings alike).
  * Each step is logged to SagaLog for auditability and crash recovery.
  *
- * Forward flow: HOLD_SEATS -> CREATE_PAYMENT -> CONFIRM_SEATS -> COMPLETE
- * Compensation: reverse order of completed steps
+ * Forward flow:  HOLD (car | seats) -> CREATE_PAYMENT -> CONFIRM (car | seats)
+ * Compensation:  reverse order of completed steps
  */
+
+async function runStep(booking, step, request, action) {
+     const sagaLog = await prisma.sagaLog.create({
+          data: { bookingId: booking.id, step, status: 'PENDING', request },
+     });
+
+     try {
+          const result = await action();
+          await prisma.sagaLog.update({
+               where: { id: sagaLog.id },
+               data: { status: 'COMPLETED', response: result ?? {} },
+          });
+          logger.info(`Saga ${step} completed for booking ${booking.id}`);
+          return result;
+     } catch (error) {
+          const errorMsg = error.response?.data?.message || error.message;
+          await prisma.sagaLog.update({
+               where: { id: sagaLog.id },
+               data: { status: 'FAILED', error: errorMsg },
+          });
+          throw error;
+     }
+}
 
 // ─── Forward Steps ───────────────────────────────────────────────────────────
 
-// --- SEGMENT BOOKING: Added fromSeq/toSeq params ---
-async function executeHoldSeats(booking, seatIds, ttlSeconds, fromSeq, toSeq) {
-     const sagaLog = await prisma.sagaLog.create({
-          data: {
-               bookingId: booking.id,
-               step: 'HOLD_SEATS',
-               status: 'PENDING',
-               request: { scheduleId: booking.scheduleId, seatIds, userId: booking.userId, ttlSeconds, fromSeq, toSeq }, // --- SEGMENT BOOKING
-          },
-     });
+async function executeHold(booking, ttlSeconds) {
+     const result = await runStep(
+          booking,
+          holds.holdStep(booking),
+          holds.isSeat(booking)
+               ? { tripId: booking.tripId, seatNumbers: booking.seatNumbers, fromSeq: booking.fromSeq, toSeq: booking.toSeq, ttlSeconds }
+               : { carId: booking.carId, pickupAt: booking.pickupAt, dropoffAt: booking.dropoffAt, ttlSeconds },
+          () => holds.placeHold(booking, ttlSeconds)
+     );
 
-     try {
-          const result = await inventoryClient.holdSeats(
-               booking.scheduleId,
-               seatIds,
-               booking.userId,
-               ttlSeconds,
-               fromSeq,  // --- SEGMENT BOOKING
-               toSeq     // --- SEGMENT BOOKING
-          );
-
-          await prisma.sagaLog.update({
-               where: { id: sagaLog.id },
-               data: { status: 'COMPLETED', response: result },
-          });
-
-          await prisma.booking.update({
-               where: { id: booking.id },
-               data: { status: 'SEATS_HELD' },
-          });
-
-          logger.info(`Saga HOLD_SEATS completed for booking ${booking.id}`);
-          return result;
-
-     } catch (error) {
-          const errorMsg = error.response?.data?.message || error.message;
-          await prisma.sagaLog.update({
-               where: { id: sagaLog.id },
-               data: { status: 'FAILED', error: errorMsg },
-          });
-          throw error;
-     }
+     await prisma.booking.update({ where: { id: booking.id }, data: { status: 'CAR_HELD' } });
+     return result;
 }
 
 async function executeCreatePayment(booking) {
-     const idempotencyKey = `${booking.id}-payment`;
+     const result = await runStep(
+          booking,
+          'CREATE_PAYMENT',
+          { bookingId: booking.id, amount: booking.totalAmount, userId: booking.userId },
+          () => paymentClient.createPaymentOrder(booking.id, booking.totalAmount, booking.userId, `${booking.id}-payment`)
+     );
 
-     const sagaLog = await prisma.sagaLog.create({
-          data: {
-               bookingId: booking.id,
-               step: 'CREATE_PAYMENT',
-               status: 'PENDING',
-               request: { bookingId: booking.id, amount: booking.totalAmount, userId: booking.userId },
-          },
+     await prisma.booking.update({
+          where: { id: booking.id },
+          data: { status: 'PAYMENT_PENDING', paymentOrderId: result.paymentOrderId },
      });
-
-     try {
-          const result = await paymentClient.createPaymentOrder(
-               booking.id,
-               booking.totalAmount,
-               booking.userId,
-               idempotencyKey
-          );
-
-          await prisma.sagaLog.update({
-               where: { id: sagaLog.id },
-               data: { status: 'COMPLETED', response: result },
-          });
-
-          await prisma.booking.update({
-               where: { id: booking.id },
-               data: {
-                    status: 'PAYMENT_PENDING',
-                    paymentOrderId: result.paymentOrderId,
-               },
-          });
-
-          logger.info(`Saga CREATE_PAYMENT completed for booking ${booking.id}`);
-          return result;
-
-     } catch (error) {
-          const errorMsg = error.response?.data?.message || error.message;
-          await prisma.sagaLog.update({
-               where: { id: sagaLog.id },
-               data: { status: 'FAILED', error: errorMsg },
-          });
-          throw error;
-     }
+     return result;
 }
 
-// --- SEGMENT BOOKING: Added fromSeq/toSeq params ---
-async function executeConfirmSeats(booking, seatIds, fromSeq, toSeq) {
-     const sagaLog = await prisma.sagaLog.create({
-          data: {
-               bookingId: booking.id,
-               step: 'CONFIRM_SEATS',
-               status: 'PENDING',
-               request: { scheduleId: booking.scheduleId, seatIds, userId: booking.userId, bookingId: booking.id, fromSeq, toSeq }, // --- SEGMENT BOOKING
-          },
-     });
-
-     try {
-          const result = await inventoryClient.confirmSeats(
-               booking.scheduleId,
-               seatIds,
-               booking.userId,
-               booking.id,
-               fromSeq,  // --- SEGMENT BOOKING
-               toSeq     // --- SEGMENT BOOKING
-          );
-
-          await prisma.sagaLog.update({
-               where: { id: sagaLog.id },
-               data: { status: 'COMPLETED', response: result },
-          });
-
-          logger.info(`Saga CONFIRM_SEATS completed for booking ${booking.id}`);
-          return result;
-
-     } catch (error) {
-          const errorMsg = error.response?.data?.message || error.message;
-          await prisma.sagaLog.update({
-               where: { id: sagaLog.id },
-               data: { status: 'FAILED', error: errorMsg },
-          });
-          throw error;
-     }
+async function executeConfirm(booking) {
+     return runStep(
+          booking,
+          holds.confirmStep(booking),
+          { bookingId: booking.id, userId: booking.userId },
+          () => holds.confirmHold(booking)
+     );
 }
 
 // ─── Compensation Steps ──────────────────────────────────────────────────────
 
-async function compensateHoldSeats(booking, seatIds) {
-     logger.info(`Compensating HOLD_SEATS for booking ${booking.id}`);
-     try {
-          // --- SEGMENT BOOKING: Pass segment params from booking for accurate compensation ---
-          await inventoryClient.releaseSeats(booking.scheduleId, seatIds, booking.userId, booking.fromSeq, booking.toSeq);
+async function markCompensated(booking, step) {
+     await prisma.sagaLog.updateMany({
+          where: { bookingId: booking.id, step, status: 'COMPLETED' },
+          data: { status: 'COMPENSATED' },
+     });
+}
 
-          // Mark saga step as compensated
-          await prisma.sagaLog.updateMany({
-               where: { bookingId: booking.id, step: 'HOLD_SEATS', status: 'COMPLETED' },
-               data: { status: 'COMPENSATED' },
-          });
+async function compensateHold(booking) {
+     logger.info(`Compensating hold for booking ${booking.id}`);
+     try {
+          await holds.releaseHold(booking);
+          await markCompensated(booking, holds.holdStep(booking));
      } catch (error) {
-          logger.error(`Failed to compensate HOLD_SEATS for booking ${booking.id}`, {
-               error: error.message,
-          });
           // Inventory lock expiry will eventually clean this up
+          logger.error(`Failed to compensate hold for booking ${booking.id}`, { error: error.message });
      }
 }
 
@@ -168,38 +99,25 @@ async function compensateCreatePayment(booking) {
 
      logger.info(`Compensating CREATE_PAYMENT for booking ${booking.id}`);
      try {
-          const idempotencyKey = `${booking.id}-refund-compensation`;
           await paymentClient.initiateRefund(
                booking.paymentOrderId,
                booking.totalAmount,
                'booking_compensation',
-               idempotencyKey
+               `${booking.id}-refund-compensation`
           );
-
-          await prisma.sagaLog.updateMany({
-               where: { bookingId: booking.id, step: 'CREATE_PAYMENT', status: 'COMPLETED' },
-               data: { status: 'COMPENSATED' },
-          });
+          await markCompensated(booking, 'CREATE_PAYMENT');
      } catch (error) {
-          logger.error(`Failed to compensate CREATE_PAYMENT for booking ${booking.id}`, {
-               error: error.message,
-          });
+          logger.error(`Failed to compensate CREATE_PAYMENT for booking ${booking.id}`, { error: error.message });
      }
 }
 
-async function compensateConfirmSeats(booking) {
-     logger.info(`Compensating CONFIRM_SEATS for booking ${booking.id}`);
+async function compensateConfirm(booking) {
+     logger.info(`Compensating confirmation for booking ${booking.id}`);
      try {
-          await inventoryClient.cancelBooking(booking.scheduleId, booking.id, booking.userId);
-
-          await prisma.sagaLog.updateMany({
-               where: { bookingId: booking.id, step: 'CONFIRM_SEATS', status: 'COMPLETED' },
-               data: { status: 'COMPENSATED' },
-          });
+          await holds.cancelReservation(booking);
+          await markCompensated(booking, holds.confirmStep(booking));
      } catch (error) {
-          logger.error(`Failed to compensate CONFIRM_SEATS for booking ${booking.id}`, {
-               error: error.message,
-          });
+          logger.error(`Failed to compensate confirmation for booking ${booking.id}`, { error: error.message });
      }
 }
 
@@ -207,7 +125,7 @@ async function compensateConfirmSeats(booking) {
  * Compensate all completed saga steps in reverse order.
  * Used when a booking needs to be rolled back (failure, timeout, cancellation).
  */
-async function compensateAll(booking, seatIds) {
+async function compensateAll(booking) {
      const completedSteps = await prisma.sagaLog.findMany({
           where: { bookingId: booking.id, status: 'COMPLETED' },
           orderBy: { createdAt: 'desc' },
@@ -215,25 +133,27 @@ async function compensateAll(booking, seatIds) {
 
      for (const step of completedSteps) {
           switch (step.step) {
+               case 'CONFIRM_CAR':
                case 'CONFIRM_SEATS':
-                    await compensateConfirmSeats(booking);
+                    await compensateConfirm(booking);
                     break;
                case 'CREATE_PAYMENT':
                     await compensateCreatePayment(booking);
                     break;
+               case 'HOLD_CAR':
                case 'HOLD_SEATS':
-                    await compensateHoldSeats(booking, seatIds);
+                    await compensateHold(booking);
                     break;
           }
      }
 }
 
 module.exports = {
-     executeHoldSeats,
+     executeHold,
      executeCreatePayment,
-     executeConfirmSeats,
-     compensateHoldSeats,
+     executeConfirm,
+     compensateHold,
      compensateCreatePayment,
-     compensateConfirmSeats,
+     compensateConfirm,
      compensateAll,
 };

@@ -9,18 +9,18 @@ const KAFKA_TOPICS = {
      BOOKING_EMAIL: 'notification.booking-email',
      PAYMENT_EMAIL: 'notification.payment-email',
 
-     // Admin topics (admin-service -> inventory/search)
-     TRAIN_CREATED: 'admin.train-created',
-     STATION_CREATED: 'admin.station-created',
-     ROUTE_CREATED: 'admin.route-created',
-     SCHEDULE_CREATED: 'admin.schedule-created',
-     TRAIN_UPDATED: 'admin.train-updated',
-     STATION_UPDATED: 'admin.station-updated',
-     ROUTE_UPDATED: 'admin.route-updated',
-     SCHEDULE_CANCELLED: 'admin.schedule-cancelled',
+     // Admin topics (admin-service -> inventory/search/booking)
+     BRANCH_CREATED: 'admin.branch-created',
+     CAR_CREATED: 'admin.car-created',
+     CAR_UPDATED: 'admin.car-updated',
+     CAR_STATUS_CHANGED: 'admin.car-status-changed',
+
+     // Shared rides (admin-service -> inventory/search/booking)
+     TRIP_SCHEDULED: 'admin.trip-scheduled',
+     TRIP_CANCELLED: 'admin.trip-cancelled',
 
      // Inventory topics (inventory-service -> search-service)
-     SEAT_AVAILABILITY_UPDATED: 'inventory.seat-availability-updated',
+     CAR_AVAILABILITY_UPDATED: 'inventory.car-availability-updated',
 
      // Booking topics (booking-service -> notification-service)
      BOOKING_CONFIRMED: 'booking.confirmed',

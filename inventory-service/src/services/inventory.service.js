@@ -5,827 +5,343 @@ const { retryTransaction } = require('../utils/retryTransaction');
 const { BadRequestError, NotFoundError, ConflictError, ForbiddenError } = require('../utils/error');
 const { config } = require('../config');
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+const parseRange = (startAt, endAt) => {
+     const start = new Date(startAt);
+     const end = new Date(endAt);
+     if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+          throw new BadRequestError('startAt and endAt must be valid ISO date-times');
+     }
+     if (start >= end) {
+          throw new BadRequestError('startAt must be before endAt');
+     }
+     return { start, end };
+};
+
+/**
+ * Active (non-expired) holds for a car that end in the future.
+ * These are the intervals during which the car cannot be rented.
+ */
+const getBlockedRanges = async (db, carId) => {
+     const holds = await db.rentalHold.findMany({
+          where: {
+               carId,
+               endAt: { gt: new Date() },
+               OR: [
+                    { status: 'BOOKED' },
+                    { status: 'LOCKED', lockExpiresAt: { gt: new Date() } },
+               ],
+          },
+          orderBy: { startAt: 'asc' },
+          select: { startAt: true, endAt: true, status: true },
+     });
+     return holds.map(h => ({ startAt: h.startAt, endAt: h.endAt, status: h.status }));
+};
+
+/**
+ * Publish the car's current blocked ranges so search-service can filter
+ * out cars that are unavailable for a requested pickup/drop-off window.
+ */
+const publishAvailability = async (carId) => {
+     try {
+          const car = await prisma.carInventory.findUnique({ where: { carId } });
+          if (!car) return;
+          const blockedRanges = await getBlockedRanges(prisma, carId);
+          await inventoryProducer.publishCarAvailabilityUpdated(carId, car.status, blockedRanges);
+     } catch (err) {
+          logger.error('Failed to publish car availability after retries', { carId, error: err.message });
+     }
+};
+
 // ─── Kafka Event Handlers ───────────────────────────────────────────────────
 
-const initializeInventory = async (eventData) => {
-     const { scheduleId, trainId, trainNumber, trainName, departureDate, seats } = eventData;
+const upsertCar = async (eventData, eventType) => {
+     const { carId, branch } = eventData;
 
-     if (!scheduleId || !seats || !seats.length) {
-          logger.warn('Invalid SCHEDULE_CREATED event — missing scheduleId or seats');
+     if (!carId || !branch) {
+          logger.warn(`Invalid ${eventType} event — missing carId or branch`);
           return;
      }
 
-     const eventKey = `SCHEDULE_CREATED:${scheduleId}`;
+     const data = {
+          registrationNumber: eventData.registrationNumber,
+          make: eventData.make,
+          model: eventData.model,
+          category: eventData.category,
+          transmission: eventData.transmission,
+          fuelType: eventData.fuelType,
+          seats: eventData.seats,
+          dailyRate: eventData.dailyRate,
+          branchId: branch.branchId,
+          branchCode: branch.code,
+          branchName: branch.name,
+          city: branch.city,
+          status: eventData.status || 'ACTIVE',
+     };
 
-     const existing = await prisma.idempotencyRecord.findUnique({ where: { eventKey } });
-     if (existing) {
-          logger.info(`Duplicate event skipped: ${eventKey}`);
-          return;
-     }
-
-     const totalSeats = seats.length;
-
-     await prisma.$transaction(async (tx) => {
-          const schedule = await tx.scheduleInventory.create({
-               data: {
-                    scheduleId,
-                    trainId,
-                    trainNumber,
-                    trainName,
-                    departureDate: new Date(departureDate),
-                    totalSeats,
-                    available: totalSeats,
-                    locked: 0,
-                    booked: 0,
-                    status: 'ACTIVE',
-               },
-          });
-
-          const seatData = seats.map(seat => ({
-               scheduleInventoryId: schedule.id,
-               scheduleId,
-               seatId: seat.seatId,
-               seatNumber: seat.seatNumber,
-               seatType: seat.seatType,
-               price: seat.price,
-               status: 'AVAILABLE',
-          }));
-
-          await tx.seatInventory.createMany({ data: seatData });
-
-          // --- SEGMENT BOOKING: Persist route topology for segment overlap checks ---
-          if (eventData.route && eventData.route.length > 0) {
-               const routeStopData = eventData.route.map(rs => ({
-                    scheduleId,
-                    stationId: rs.stationId,
-                    stationName: rs.stationName,
-                    stationCode: rs.stationCode,
-                    sequenceNumber: rs.sequenceNumber,
-               }));
-               await tx.routeStop.createMany({ data: routeStopData });
-               logger.info(`Persisted ${routeStopData.length} route stops for schedule ${scheduleId}`);
-          }
-
-          await tx.idempotencyRecord.create({ data: { eventKey } });
+     // Upsert keeps both CAR_CREATED and CAR_UPDATED idempotent on redelivery
+     await prisma.carInventory.upsert({
+          where: { carId },
+          create: { carId, ...data },
+          update: { ...data, version: { increment: 1 } },
      });
 
-     logger.info(`Inventory initialized for schedule ${scheduleId} with ${totalSeats} seats`);
-
-     try {
-          await inventoryProducer.publishSeatAvailabilityUpdated(scheduleId, trainId, totalSeats, 0, 0);
-     } catch (err) {
-          logger.error('Failed to publish initial availability event after retries', { scheduleId, error: err.message });
-     }
+     logger.info(`Inventory ${eventType === 'CAR_CREATED' ? 'initialised' : 'updated'} for car ${eventData.registrationNumber}`);
+     await publishAvailability(carId);
 };
 
-const cancelScheduleInventory = async (eventData) => {
-     const data = eventData.data || eventData;
-     const scheduleId = data.scheduleId || data.id;
-
-     if (!scheduleId) {
-          logger.warn('Invalid SCHEDULE_CANCELLED event — missing scheduleId');
+const handleCarStatusChanged = async (eventData) => {
+     const { carId, status } = eventData;
+     if (!carId || !status) {
+          logger.warn('Invalid CAR_STATUS_CHANGED event — missing carId or status');
           return;
      }
 
-     const eventKey = `SCHEDULE_CANCELLED:${scheduleId}`;
-
-     const existing = await prisma.idempotencyRecord.findUnique({ where: { eventKey } });
-     if (existing) {
-          logger.info(`Duplicate event skipped: ${eventKey}`);
+     const car = await prisma.carInventory.findUnique({ where: { carId } });
+     if (!car) {
+          logger.warn(`Car ${carId} not found in inventory — skipping status change`);
           return;
      }
 
-     const schedule = await prisma.scheduleInventory.findUnique({ where: { scheduleId } });
-     if (!schedule) {
-          logger.warn(`Schedule ${scheduleId} not found in inventory — skipping cancellation`);
-          return;
-     }
-
-     await prisma.$transaction(async (tx) => {
-          await tx.scheduleInventory.update({
-               where: { scheduleId },
-               data: { status: 'CANCELLED', available: 0, locked: 0, booked: 0, version: { increment: 1 } },
-          });
-
-          await tx.seatInventory.updateMany({
-               where: { scheduleId },
-               data: { status: 'CANCELLED' },
-          });
-
-          await tx.idempotencyRecord.create({ data: { eventKey } });
+     await prisma.carInventory.update({
+          where: { carId },
+          data: { status, version: { increment: 1 } },
      });
 
-     logger.info(`Inventory cancelled for schedule ${scheduleId}`);
-
-     try {
-          await inventoryProducer.publishSeatAvailabilityUpdated(scheduleId, schedule.trainId, 0, 0, 0);
-     } catch (err) {
-          logger.error('Failed to publish cancellation availability event after retries', { scheduleId, error: err.message });
-     }
+     // Existing holds are released by booking-service as it cancels the affected bookings
+     logger.info(`Car ${car.registrationNumber} is now ${status} in inventory`);
+     await publishAvailability(carId);
 };
-
-// ─── Segment Booking Helpers ─────────────────────────────────────────────────
-
-/**
- * Recompute SeatInventory.status for a set of seats based on their current
- * SeatSegmentLock rows.  Each physical seat gets exactly ONE summary status:
- *   - AVAILABLE  → no active segment locks at all
- *   - LOCKED     → at least one LOCKED segment lock exists
- *   - BOOKED     → all active segment locks are BOOKED (none LOCKED)
- *
- * Returns the count of seats whose status actually changed to/from AVAILABLE
- * so the caller can decide whether aggregate counters need adjusting.
- */
-async function recomputeSegmentSeatStatuses(tx, scheduleId, seatIds) {
-     const statusChanges = { nowAvailable: 0, nowOccupied: 0, lockedToBooked: 0, bookedToLocked: 0 };
-
-     for (const seatId of seatIds) {
-          const locks = await tx.seatSegmentLock.findMany({
-               where: { scheduleId, seatId, status: { in: ['LOCKED', 'BOOKED'] } },
-               select: { status: true },
-          });
-
-          // Determine the correct summary status
-          let newStatus;
-          if (locks.length === 0) {
-               newStatus = 'AVAILABLE';
-          } else if (locks.some(l => l.status === 'LOCKED')) {
-               newStatus = 'LOCKED';
-          } else {
-               newStatus = 'BOOKED';
-          }
-
-          // Read current status to detect transitions
-          const current = await tx.$queryRaw`
-               SELECT status FROM seat_inventories
-               WHERE "scheduleId" = ${scheduleId} AND "seatId" = ${seatId}
-               FOR UPDATE NOWAIT
-          `;
-          const oldStatus = current[0]?.status;
-
-          if (oldStatus === newStatus) continue; // no change needed
-
-          // Track transitions for aggregate counter adjustment
-          if (oldStatus === 'AVAILABLE' && newStatus !== 'AVAILABLE') statusChanges.nowOccupied++;
-          if (oldStatus !== 'AVAILABLE' && newStatus === 'AVAILABLE') statusChanges.nowAvailable++;
-          if (oldStatus === 'LOCKED' && newStatus === 'BOOKED') statusChanges.lockedToBooked++;
-          if (oldStatus === 'BOOKED' && newStatus === 'LOCKED') statusChanges.bookedToLocked++;
-
-          // Update the summary row
-          await tx.$executeRaw`
-               UPDATE seat_inventories
-               SET status = ${newStatus}::"SeatStatus",
-                   "lockedBy" = CASE WHEN ${newStatus} = 'AVAILABLE' THEN NULL ELSE "lockedBy" END,
-                   "lockedAt" = CASE WHEN ${newStatus} = 'AVAILABLE' THEN NULL ELSE "lockedAt" END,
-                   "lockExpiresAt" = CASE WHEN ${newStatus} = 'AVAILABLE' THEN NULL ELSE "lockExpiresAt" END,
-                   "bookingId" = CASE WHEN ${newStatus} = 'AVAILABLE' THEN NULL ELSE "bookingId" END,
-                   version = version + 1, "updatedAt" = NOW()
-               WHERE "scheduleId" = ${scheduleId} AND "seatId" = ${seatId}
-          `;
-     }
-
-     return statusChanges;
-}
-
-/**
- * Recount schedule_inventories aggregate columns from actual seat_inventories rows.
- * This is the source of truth — avoids counter drift from arithmetic updates.
- */
-async function recountScheduleAggregates(tx, scheduleId) {
-     const counts = await tx.$queryRaw`
-          SELECT
-               COUNT(*) FILTER (WHERE status = 'AVAILABLE')::int AS available,
-               COUNT(*) FILTER (WHERE status = 'LOCKED')::int AS locked,
-               COUNT(*) FILTER (WHERE status = 'BOOKED')::int AS booked
-          FROM seat_inventories
-          WHERE "scheduleId" = ${scheduleId}
-     `;
-
-     const { available, locked, booked } = counts[0];
-
-     await tx.$executeRaw`
-          UPDATE schedule_inventories
-          SET available = ${available}, locked = ${locked}, booked = ${booked},
-              version = version + 1, "updatedAt" = NOW()
-          WHERE "scheduleId" = ${scheduleId}
-     `;
-
-     return { available, locked, booked };
-}
 
 // ─── REST API Handlers ──────────────────────────────────────────────────────
 
-const getAvailability = async (scheduleId) => {
-     const schedule = await prisma.scheduleInventory.findUnique({ where: { scheduleId } });
-     if (!schedule) throw new NotFoundError('Schedule not found in inventory');
+/**
+ * Public availability view for one car. If a window is given, also answers
+ * "is this car free for [startAt, endAt)?".
+ */
+const getAvailability = async (carId, startAt, endAt) => {
+     const car = await prisma.carInventory.findUnique({ where: { carId } });
+     if (!car) throw new NotFoundError('Car not found in inventory');
 
-     return {
-          scheduleId: schedule.scheduleId,
-          trainId: schedule.trainId,
-          trainNumber: schedule.trainNumber,
-          trainName: schedule.trainName,
-          departureDate: schedule.departureDate,
-          status: schedule.status,
-          totalSeats: schedule.totalSeats,
-          available: schedule.available,
-          locked: schedule.locked,
-          booked: schedule.booked,
-     };
-};
+     const blockedRanges = await getBlockedRanges(prisma, carId);
 
-const getSeats = async (scheduleId, filters = {}) => {
-     const schedule = await prisma.scheduleInventory.findUnique({ where: { scheduleId } });
-     if (!schedule) throw new NotFoundError('Schedule not found in inventory');
-
-     const where = { scheduleId };
-     if (filters.status) where.status = filters.status;
-     if (filters.seatType) where.seatType = filters.seatType;
-
-     let seats = await prisma.seatInventory.findMany({
-          where,
-          orderBy: { seatNumber: 'asc' },
-          select: {
-               seatId: true,
-               seatNumber: true,
-               seatType: true,
-               price: true,
-               status: true,
-               lockedBy: true,
-               lockExpiresAt: true,
-               bookingId: true,
-          },
-     });
-
-     // --- SEGMENT BOOKING: If segment specified, compute per-seat segment availability ---
-     if (filters.fromSeq && filters.toSeq) {
-          const fromSeq = parseInt(filters.fromSeq);
-          const toSeq = parseInt(filters.toSeq);
-
-          // Find all active segment locks that overlap with the requested segment
-          const overlappingLocks = await prisma.seatSegmentLock.findMany({
-               where: {
-                    scheduleId,
-                    status: { in: ['LOCKED', 'BOOKED'] },
-                    fromSeq: { lt: toSeq },   // overlap condition: a.from < b.to
-                    toSeq: { gt: fromSeq },    // overlap condition: b.from < a.to
-               },
-               select: { seatId: true, status: true },
-          });
-
-          const blockedSeatIds = new Set(overlappingLocks.map(l => l.seatId));
-
-          // --- SEGMENT BOOKING: Find seats that have ANY segment locks (to distinguish legacy bookings) ---
-          const seatsWithAnyLock = await prisma.seatSegmentLock.findMany({
-               where: { scheduleId, status: { in: ['LOCKED', 'BOOKED'] } },
-               select: { seatId: true },
-               distinct: ['seatId'],
-          });
-          const seatsWithLocks = new Set(seatsWithAnyLock.map(l => l.seatId));
-
-          // Add segmentStatus: UNAVAILABLE if overlapping lock exists, or if seat is
-          // BOOKED/LOCKED with no segment locks at all (legacy pre-segment booking).
-          // AVAILABLE only if no overlapping locks AND (seat has segment locks OR seat is AVAILABLE).
-          seats = seats.map(seat => {
-               if (blockedSeatIds.has(seat.seatId)) {
-                    return { ...seat, segmentStatus: 'UNAVAILABLE' };
-               }
-               // Legacy booking: seat is BOOKED/LOCKED but has no segment lock records
-               // → treat as booked for entire journey (backward compat)
-               if ((seat.status === 'BOOKED' || seat.status === 'LOCKED') && !seatsWithLocks.has(seat.seatId)) {
-                    return { ...seat, segmentStatus: 'UNAVAILABLE' };
-               }
-               return { ...seat, segmentStatus: 'AVAILABLE' };
-          });
+     let requested = null;
+     if (startAt && endAt) {
+          const { start, end } = parseRange(startAt, endAt);
+          const conflict = blockedRanges.some(r => r.startAt < end && start < r.endAt);
+          requested = {
+               startAt: start,
+               endAt: end,
+               available: car.status === 'ACTIVE' && !conflict,
+          };
      }
 
      return {
-          scheduleId,
-          totalSeats: schedule.totalSeats,
-          seats,
+          carId: car.carId,
+          registrationNumber: car.registrationNumber,
+          make: car.make,
+          model: car.model,
+          category: car.category,
+          transmission: car.transmission,
+          fuelType: car.fuelType,
+          seats: car.seats,
+          dailyRate: car.dailyRate,
+          branchId: car.branchId,
+          branchCode: car.branchCode,
+          branchName: car.branchName,
+          city: car.city,
+          status: car.status,
+          blockedRanges: blockedRanges.map(r => ({ startAt: r.startAt, endAt: r.endAt })),
+          requested,
      };
 };
 
-// --- SEGMENT BOOKING: Added fromSeq/toSeq params for segment-aware locking ---
-const lockSeats = async (scheduleId, seatIds, userId, ttlSeconds, fromSeq, toSeq) => {
-     const ttl = Math.min(Math.max(ttlSeconds || config.LOCK_TTL_SECONDS, 60), 600);
+/**
+ * Place a temporary hold on a car for [startAt, endAt).
+ *
+ * Concurrency: the car's inventory row is locked FOR UPDATE NOWAIT, so all hold
+ * changes for one car are serialised. Inside that critical section we purge expired
+ * holds, check for overlap, then insert. The exclusion constraint backs this up.
+ */
+const lockCar = async (carId, bookingId, startAt, endAt, userId, ttlSeconds) => {
+     const { start, end } = parseRange(startAt, endAt);
+     const ttl = Math.min(Math.max(ttlSeconds || config.LOCK_TTL_SECONDS, 60), 900);
      const lockExpiresAt = new Date(Date.now() + ttl * 1000);
 
      const result = await retryTransaction(async () => {
           return prisma.$transaction(async (tx) => {
-               // Verify schedule is active
-               const schedule = await tx.scheduleInventory.findUnique({ where: { scheduleId } });
-               if (!schedule) throw new NotFoundError('Schedule not found in inventory');
-               if (schedule.status !== 'ACTIVE') throw new BadRequestError('Schedule is not active');
-
-               // Row-level lock on requested seats
-               const seats = await tx.$queryRaw`
-                    SELECT id, "seatId", "seatNumber", status, "lockedBy"
-                    FROM seat_inventories
-                    WHERE "scheduleId" = ${scheduleId}
-                    AND "seatId" = ANY(${seatIds}::text[])
+               const rows = await tx.$queryRaw`
+                    SELECT "carId", status FROM car_inventories
+                    WHERE "carId" = ${carId}
                     FOR UPDATE NOWAIT
                `;
+               if (rows.length === 0) throw new NotFoundError('Car not found in inventory');
+               if (rows[0].status !== 'ACTIVE') throw new BadRequestError('Car is not available for rent');
 
-               // All seats must exist
-               if (seats.length !== seatIds.length) {
-                    const foundIds = new Set(seats.map(s => s.seatId));
-                    const missing = seatIds.filter(id => !foundIds.has(id));
-                    throw new NotFoundError(`Seats not found: ${missing.join(', ')}`);
+               // Idempotent: the same booking re-requesting its own hold
+               const existing = await tx.rentalHold.findUnique({ where: { bookingId } });
+               if (existing) {
+                    return { carId, bookingId, startAt: existing.startAt, endAt: existing.endAt, lockExpiresAt: existing.lockExpiresAt };
                }
 
-               // --- SEGMENT BOOKING: Check segment-level availability instead of full-journey ---
-               if (fromSeq && toSeq) {
-                    // Check for overlapping segment locks on any of the requested seats
-                    const overlapping = await tx.$queryRaw`
-                         SELECT "seatId" FROM seat_segment_locks
-                         WHERE "scheduleId" = ${scheduleId}
-                         AND "seatId" = ANY(${seatIds}::text[])
-                         AND status IN ('LOCKED', 'BOOKED')
-                         AND "fromSeq" < ${toSeq}
-                         AND "toSeq" > ${fromSeq}
-                         FOR UPDATE NOWAIT
-                    `;
+               // Expired holds no longer block anyone — purge them inside the critical section
+               await tx.rentalHold.deleteMany({
+                    where: { carId, status: 'LOCKED', lockExpiresAt: { lt: new Date() } },
+               });
 
-                    if (overlapping.length > 0) {
-                         const blockedIds = [...new Set(overlapping.map(r => r.seatId))];
-                         throw new ConflictError(
-                              `Seats already locked/booked for overlapping segment: ${blockedIds.join(', ')}`,
-                              'SEATS_UNAVAILABLE'
-                         );
-                    }
-
-                    // Create segment lock rows for the requested segment
-                    for (const seat of seats) {
-                         await tx.seatSegmentLock.create({
-                              data: {
-                                   scheduleId,
-                                   seatId: seat.seatId,
-                                   fromSeq,
-                                   toSeq,
-                                   status: 'LOCKED',
-                                   lockedBy: userId,
-                                   lockedAt: new Date(),
-                                   lockExpiresAt,
-                              },
-                         });
-                    }
-               } else {
-                    // Fallback: full-journey lock (no segment) — all seats must be AVAILABLE
-                    const unavailable = seats.filter(s => s.status !== 'AVAILABLE');
-                    if (unavailable.length > 0) {
-                         throw new ConflictError(
-                              `Seats not available: ${unavailable.map(s => `seat #${s.seatNumber} is ${s.status}`).join(', ')}`,
-                              'SEATS_UNAVAILABLE'
-                         );
-                    }
-               }
-
-               // --- SEGMENT BOOKING: Recompute seat statuses from segment locks ---
-               if (fromSeq && toSeq) {
-                    // Set lockedBy/lockedAt/lockExpiresAt on seats that didn't have it yet
-                    const seatPkIds = seats.map(s => s.id);
-                    await tx.$executeRaw`
-                         UPDATE seat_inventories
-                         SET "lockedBy" = COALESCE("lockedBy", ${userId}),
-                             "lockedAt" = COALESCE("lockedAt", NOW()),
-                             "lockExpiresAt" = ${lockExpiresAt}::timestamp,
-                             "updatedAt" = NOW()
-                         WHERE id = ANY(${seatPkIds}::text[])
-                    `;
-
-                    // Recompute each seat's summary status from its segment locks
-                    const affectedSeatIds = seats.map(s => s.seatId);
-                    await recomputeSegmentSeatStatuses(tx, scheduleId, affectedSeatIds);
-
-                    // Recount aggregates from actual seat rows (prevents counter drift)
-                    const counts = await recountScheduleAggregates(tx, scheduleId);
-
-                    return {
-                         scheduleId,
-                         trainId: schedule.trainId,
-                         lockedSeats: seats.map(s => ({
-                              seatId: s.seatId,
-                              seatNumber: s.seatNumber,
-                              lockExpiresAt,
-                         })),
-                         lockExpiresAt,
-                         counts,
-                    };
-               }
-
-               // Full-journey: unconditional lock (original fast path)
-               const seatPkIds = seats.map(s => s.id);
-               await tx.$executeRaw`
-                    UPDATE seat_inventories
-                    SET status = 'LOCKED', "lockedBy" = ${userId},
-                        "lockedAt" = NOW(), "lockExpiresAt" = ${lockExpiresAt}::timestamp,
-                        version = version + 1, "updatedAt" = NOW()
-                    WHERE id = ANY(${seatPkIds}::text[])
-               `;
-
-               await tx.$executeRaw`
-                    UPDATE schedule_inventories
-                    SET available = available - ${seats.length},
-                        locked = locked + ${seats.length},
-                        version = version + 1,
-                        "updatedAt" = NOW()
-                    WHERE "scheduleId" = ${scheduleId}
-               `;
-
-               return {
-                    scheduleId,
-                    trainId: schedule.trainId,
-                    lockedSeats: seats.map(s => ({
-                         seatId: s.seatId,
-                         seatNumber: s.seatNumber,
-                         lockExpiresAt,
-                    })),
-                    lockExpiresAt,
-                    counts: {
-                         available: schedule.available - seats.length,
-                         locked: schedule.locked + seats.length,
-                         booked: schedule.booked,
+               const overlapping = await tx.rentalHold.findFirst({
+                    where: {
+                         carId,
+                         startAt: { lt: end },   // overlap condition: a.start < b.end
+                         endAt: { gt: start },   // overlap condition: b.start < a.end
                     },
-               };
-          }, { timeout: 10000 });
-     });
+                    select: { startAt: true, endAt: true },
+               });
 
-     // Publish availability update (fire and forget)
-     try {
-          await inventoryProducer.publishSeatAvailabilityUpdated(
-               result.scheduleId, result.trainId,
-               result.counts.available, result.counts.locked, result.counts.booked
-          );
-     } catch (err) {
-          logger.error('Failed to publish availability after lock', { scheduleId: result.scheduleId, error: err.message });
-     }
-
-     return result;
-};
-
-// --- SEGMENT BOOKING: Added fromSeq/toSeq params for segment-aware unlocking ---
-const unlockSeats = async (scheduleId, seatIds, userId, fromSeq, toSeq) => {
-     const result = await retryTransaction(async () => {
-          return prisma.$transaction(async (tx) => {
-               // Row-level lock
-               const seats = await tx.$queryRaw`
-                    SELECT id, "seatId", "seatNumber", status, "lockedBy"
-                    FROM seat_inventories
-                    WHERE "scheduleId" = ${scheduleId}
-                    AND "seatId" = ANY(${seatIds}::text[])
-                    FOR UPDATE NOWAIT
-               `;
-
-               if (seats.length !== seatIds.length) {
-                    throw new NotFoundError('One or more seats not found');
-               }
-
-               // --- SEGMENT BOOKING: Segment-aware unlock ---
-               if (fromSeq && toSeq) {
-                    // Delete specific segment locks for this user/segment
-                    await tx.$executeRaw`
-                         DELETE FROM seat_segment_locks
-                         WHERE "scheduleId" = ${scheduleId}
-                         AND "seatId" = ANY(${seatIds}::text[])
-                         AND "lockedBy" = ${userId}
-                         AND "fromSeq" = ${fromSeq}
-                         AND "toSeq" = ${toSeq}
-                         AND status = 'LOCKED'
-                    `;
-
-                    // Recompute seat statuses + aggregates from actual segment lock state
-                    const affectedSeatIds = seats.map(s => s.seatId);
-                    await recomputeSegmentSeatStatuses(tx, scheduleId, affectedSeatIds);
-                    const counts = await recountScheduleAggregates(tx, scheduleId);
-
-                    const schedule = await tx.scheduleInventory.findUnique({ where: { scheduleId } });
-
-                    return {
-                         scheduleId,
-                         trainId: schedule.trainId,
-                         unlockedSeats: seats.map(s => s.seatId),
-                         counts,
-                    };
-               }
-
-               // Fallback: full-journey unlock (no segment params)
-               // All must be LOCKED
-               const notLocked = seats.filter(s => s.status !== 'LOCKED');
-               if (notLocked.length > 0) {
+               if (overlapping) {
                     throw new ConflictError(
-                         `Seats not in LOCKED status: ${notLocked.map(s => `seat #${s.seatNumber} is ${s.status}`).join(', ')}`
+                         `Car is already reserved from ${overlapping.startAt.toISOString()} to ${overlapping.endAt.toISOString()}`,
+                         'CAR_UNAVAILABLE'
                     );
                }
 
-               // All must be locked by this user
-               const notOwnedByUser = seats.filter(s => s.lockedBy !== userId);
-               if (notOwnedByUser.length > 0) {
-                    throw new ForbiddenError('Some seats are not locked by you');
-               }
-
-               // Unlock
-               const seatPkIds = seats.map(s => s.id);
-               await tx.$executeRaw`
-                    UPDATE seat_inventories
-                    SET status = 'AVAILABLE', "lockedBy" = NULL,
-                        "lockedAt" = NULL, "lockExpiresAt" = NULL,
-                        version = version + 1, "updatedAt" = NOW()
-                    WHERE id = ANY(${seatPkIds}::text[])
-               `;
-
-               const schedule = await tx.scheduleInventory.findUnique({ where: { scheduleId } });
-
-               await tx.$executeRaw`
-                    UPDATE schedule_inventories
-                    SET available = available + ${seats.length},
-                        locked = locked - ${seats.length},
-                        version = version + 1,
-                        "updatedAt" = NOW()
-                    WHERE "scheduleId" = ${scheduleId}
-               `;
-
-               return {
-                    scheduleId,
-                    trainId: schedule.trainId,
-                    unlockedSeats: seats.map(s => s.seatId),
-                    counts: {
-                         available: schedule.available + seats.length,
-                         locked: schedule.locked - seats.length,
-                         booked: schedule.booked,
-                    },
-               };
-          }, { timeout: 10000 });
-     });
-
-     try {
-          await inventoryProducer.publishSeatAvailabilityUpdated(
-               result.scheduleId, result.trainId,
-               result.counts.available, result.counts.locked, result.counts.booked
-          );
-     } catch (err) {
-          logger.error('Failed to publish availability after unlock', { scheduleId: result.scheduleId, error: err.message });
-     }
-
-     return result;
-};
-
-// --- SEGMENT BOOKING: Added fromSeq/toSeq params for segment-aware confirmation ---
-const confirmSeats = async (scheduleId, seatIds, userId, bookingId, fromSeq, toSeq) => {
-     const result = await retryTransaction(async () => {
-          return prisma.$transaction(async (tx) => {
-               const seats = await tx.$queryRaw`
-                    SELECT id, "seatId", "seatNumber", status, "lockedBy"
-                    FROM seat_inventories
-                    WHERE "scheduleId" = ${scheduleId}
-                    AND "seatId" = ANY(${seatIds}::text[])
-                    FOR UPDATE NOWAIT
-               `;
-
-               if (seats.length !== seatIds.length) {
-                    throw new NotFoundError('One or more seats not found');
-               }
-
-               // --- SEGMENT BOOKING: Confirm segment locks if segment params provided ---
-               if (fromSeq && toSeq) {
-                    // Transition segment lock rows from LOCKED → BOOKED
-                    const updated = await tx.$executeRaw`
-                         UPDATE seat_segment_locks
-                         SET status = 'BOOKED', "bookingId" = ${bookingId},
-                             "lockExpiresAt" = NULL,
-                             version = version + 1, "updatedAt" = NOW()
-                         WHERE "scheduleId" = ${scheduleId}
-                         AND "seatId" = ANY(${seatIds}::text[])
-                         AND "lockedBy" = ${userId}
-                         AND "fromSeq" = ${fromSeq}
-                         AND "toSeq" = ${toSeq}
-                         AND status = 'LOCKED'
-                    `;
-
-                    if (updated === 0) {
-                         throw new ConflictError(
-                              'Segment lock expired or not found. Please lock seats again.',
-                              'LOCK_EXPIRED'
-                         );
-                    }
-               } else {
-                    // Fallback: full-journey confirmation checks
-                    const notLocked = seats.filter(s => s.status !== 'LOCKED');
-                    if (notLocked.length > 0) {
-                         throw new ConflictError(
-                              'Lock expired or seats not in LOCKED status. Please lock seats again.',
-                              'LOCK_EXPIRED'
-                         );
-                    }
-
-                    const notOwnedByUser = seats.filter(s => s.lockedBy !== userId);
-                    if (notOwnedByUser.length > 0) {
-                         throw new ForbiddenError('Some seats are not locked by you');
-                    }
-               }
-
-               // --- SEGMENT BOOKING: Recompute seat statuses after segment lock transition ---
-               if (fromSeq && toSeq) {
-                    const affectedSeatIds = seats.map(s => s.seatId);
-                    await recomputeSegmentSeatStatuses(tx, scheduleId, affectedSeatIds);
-                    const counts = await recountScheduleAggregates(tx, scheduleId);
-
-                    const schedule = await tx.scheduleInventory.findUnique({ where: { scheduleId } });
-
-                    return {
-                         scheduleId,
-                         trainId: schedule.trainId,
+               await tx.rentalHold.create({
+                    data: {
+                         carId,
                          bookingId,
-                         confirmedSeats: seats.map(s => ({
-                              seatId: s.seatId,
-                              seatNumber: s.seatNumber,
-                              status: 'BOOKED',
-                         })),
-                         counts,
-                    };
-               }
-
-               // Full-journey: unconditional confirm (original fast path)
-               const seatPkIds = seats.map(s => s.id);
-               await tx.$executeRaw`
-                    UPDATE seat_inventories
-                    SET status = 'BOOKED', "bookingId" = ${bookingId},
-                        "lockExpiresAt" = NULL,
-                        version = version + 1, "updatedAt" = NOW()
-                    WHERE id = ANY(${seatPkIds}::text[])
-               `;
-
-               const schedule = await tx.scheduleInventory.findUnique({ where: { scheduleId } });
-
-               await tx.$executeRaw`
-                    UPDATE schedule_inventories
-                    SET locked = locked - ${seats.length},
-                        booked = booked + ${seats.length},
-                        version = version + 1,
-                        "updatedAt" = NOW()
-                    WHERE "scheduleId" = ${scheduleId}
-               `;
-
-               return {
-                    scheduleId,
-                    trainId: schedule.trainId,
-                    bookingId,
-                    confirmedSeats: seats.map(s => ({
-                         seatId: s.seatId,
-                         seatNumber: s.seatNumber,
-                         status: 'BOOKED',
-                    })),
-                    counts: {
-                         available: schedule.available,
-                         locked: schedule.locked - seats.length,
-                         booked: schedule.booked + seats.length,
+                         startAt: start,
+                         endAt: end,
+                         status: 'LOCKED',
+                         lockedBy: userId,
+                         lockExpiresAt,
                     },
-               };
-          }, { timeout: 10000 });
-     });
-
-     try {
-          await inventoryProducer.publishSeatAvailabilityUpdated(
-               result.scheduleId, result.trainId,
-               result.counts.available, result.counts.locked, result.counts.booked
-          );
-     } catch (err) {
-          logger.error('Failed to publish availability after confirm', { scheduleId: result.scheduleId, error: err.message });
-     }
-
-     return result;
-};
-
-const cancelBooking = async (scheduleId, bookingId, userId) => {
-     const result = await retryTransaction(async () => {
-          return prisma.$transaction(async (tx) => {
-               // --- SEGMENT BOOKING: Check segment locks FIRST ---
-               // For segment bookings, seat_inventories.bookingId is not set
-               // (only seat_segment_locks has the bookingId), so we must check here first.
-               const segmentLocks = await tx.seatSegmentLock.findMany({
-                    where: { scheduleId, bookingId, status: 'BOOKED' },
                });
 
-               if (segmentLocks.length > 0) {
-                    await tx.$executeRaw`
-                         DELETE FROM seat_segment_locks
-                         WHERE "scheduleId" = ${scheduleId}
-                         AND "bookingId" = ${bookingId}
-                    `;
+               await tx.carInventory.update({
+                    where: { carId },
+                    data: { version: { increment: 1 } },
+               });
 
-                    // Recompute seat statuses + aggregates from actual segment lock state
-                    const affectedSeatIds = [...new Set(segmentLocks.map(l => l.seatId))];
-                    await recomputeSegmentSeatStatuses(tx, scheduleId, affectedSeatIds);
-                    const counts = await recountScheduleAggregates(tx, scheduleId);
-
-                    const schedule = await tx.scheduleInventory.findUnique({ where: { scheduleId } });
-
-                    return {
-                         scheduleId,
-                         trainId: schedule.trainId,
-                         bookingId,
-                         releasedSeats: affectedSeatIds,
-                         counts,
-                    };
-               }
-               // --- END SEGMENT BOOKING ---
-
-               // Fallback: full-journey cancel (no segment locks found)
-               const seats = await tx.$queryRaw`
-                    SELECT id, "seatId", "seatNumber", status, "lockedBy"
-                    FROM seat_inventories
-                    WHERE "scheduleId" = ${scheduleId}
-                    AND "bookingId" = ${bookingId}
-                    AND status = 'BOOKED'
-                    FOR UPDATE NOWAIT
-               `;
-
-               if (seats.length === 0) {
-                    throw new NotFoundError('No booked seats found for this booking');
-               }
-
-               const seatPkIds = seats.map(s => s.id);
-               await tx.$executeRaw`
-                    UPDATE seat_inventories
-                    SET status = 'AVAILABLE', "lockedBy" = NULL,
-                        "lockedAt" = NULL, "lockExpiresAt" = NULL, "bookingId" = NULL,
-                        version = version + 1, "updatedAt" = NOW()
-                    WHERE id = ANY(${seatPkIds}::text[])
-               `;
-
-               const schedule = await tx.scheduleInventory.findUnique({ where: { scheduleId } });
-
-               await tx.$executeRaw`
-                    UPDATE schedule_inventories
-                    SET available = available + ${seats.length},
-                        booked = booked - ${seats.length},
-                        version = version + 1,
-                        "updatedAt" = NOW()
-                    WHERE "scheduleId" = ${scheduleId}
-               `;
-
-               return {
-                    scheduleId,
-                    trainId: schedule.trainId,
-                    bookingId,
-                    releasedSeats: seats.map(s => s.seatId),
-                    counts: {
-                         available: schedule.available + seats.length,
-                         locked: schedule.locked,
-                         booked: schedule.booked - seats.length,
-                    },
-               };
+               return { carId, bookingId, startAt: start, endAt: end, lockExpiresAt };
           }, { timeout: 10000 });
+     }).catch((err) => {
+          // 23P01 = exclusion_violation: the DB constraint caught an overlap
+          if (err.code === 'P2004' || err.meta?.code === '23P01' || err.message?.includes('rental_holds_no_overlap')) {
+               throw new ConflictError('Car is already reserved for an overlapping period', 'CAR_UNAVAILABLE');
+          }
+          throw err;
      });
 
-     try {
-          await inventoryProducer.publishSeatAvailabilityUpdated(
-               result.scheduleId, result.trainId,
-               result.counts.available, result.counts.locked, result.counts.booked
-          );
-     } catch (err) {
-          logger.error('Failed to publish availability after cancel-booking', { scheduleId: result.scheduleId, error: err.message });
-     }
-
+     await publishAvailability(carId);
      return result;
 };
 
-// ─── Lock Expiry Helper (used by lockExpiry.js) ─────────────────────────────
+/**
+ * Block a car for a shared-ride trip (admin-service, synchronous). Stored as a
+ * permanent BOOKED hold so rentals and other trips can't overlap it.
+ */
+const reserveCarForTrip = async (carId, reservationId, startAt, endAt) => {
+     const { start, end } = parseRange(startAt, endAt);
 
-const recountAndPublish = async (scheduleId) => {
-     const counts = await prisma.$queryRaw`
-          SELECT
-               COUNT(*) FILTER (WHERE status = 'AVAILABLE')::int AS available,
-               COUNT(*) FILTER (WHERE status = 'LOCKED')::int AS locked,
-               COUNT(*) FILTER (WHERE status = 'BOOKED')::int AS booked
-          FROM seat_inventories
-          WHERE "scheduleId" = ${scheduleId}
-     `;
+     await retryTransaction(async () => prisma.$transaction(async (tx) => {
+          const rows = await tx.$queryRaw`
+               SELECT "carId", status FROM car_inventories WHERE "carId" = ${carId} FOR UPDATE NOWAIT
+          `;
+          if (rows.length === 0) throw new NotFoundError('Car not found in inventory');
+          if (rows[0].status !== 'ACTIVE') throw new BadRequestError('Car is not active');
 
-     const { available, locked, booked } = counts[0];
+          const existing = await tx.rentalHold.findUnique({ where: { bookingId: reservationId } });
+          if (existing) return;
 
-     const schedule = await prisma.scheduleInventory.update({
-          where: { scheduleId },
-          data: { available, locked, booked, version: { increment: 1 } },
+          await tx.rentalHold.deleteMany({ where: { carId, status: 'LOCKED', lockExpiresAt: { lt: new Date() } } });
+          const overlapping = await tx.rentalHold.findFirst({
+               where: { carId, startAt: { lt: end }, endAt: { gt: start } },
+               select: { startAt: true, endAt: true },
+          });
+          if (overlapping) {
+               throw new ConflictError(
+                    `Car is already booked from ${overlapping.startAt.toISOString()} to ${overlapping.endAt.toISOString()}`,
+                    'CAR_UNAVAILABLE'
+               );
+          }
+
+          await tx.rentalHold.create({
+               data: { carId, bookingId: reservationId, startAt: start, endAt: end, status: 'BOOKED', lockedBy: 'trip', lockExpiresAt: null },
+          });
+     }, { timeout: 10000 }));
+
+     await publishAvailability(carId);
+     return { carId, reservationId, startAt: start, endAt: end };
+};
+
+const releaseCarReservation = async (carId, reservationId) => {
+     const deleted = await prisma.rentalHold.deleteMany({ where: { carId, bookingId: reservationId } });
+     if (deleted.count) await publishAvailability(carId);
+     return { carId, reservationId, released: deleted.count > 0 };
+};
+
+const releaseCar = async (carId, bookingId, userId) => {
+     const deleted = await prisma.rentalHold.deleteMany({
+          where: { carId, bookingId, status: 'LOCKED' },
      });
 
-     try {
-          await inventoryProducer.publishSeatAvailabilityUpdated(scheduleId, schedule.trainId, available, locked, booked);
-     } catch (err) {
-          logger.error('Failed to publish availability after recount', { scheduleId, error: err.message });
+     if (deleted.count > 0) {
+          logger.info(`Released hold on car ${carId} for booking ${bookingId}`, { userId });
+          await publishAvailability(carId);
      }
 
-     return { available, locked, booked };
+     return { carId, bookingId, released: deleted.count > 0 };
+};
+
+const confirmCar = async (carId, bookingId, userId) => {
+     const result = await retryTransaction(async () => {
+          return prisma.$transaction(async (tx) => {
+               const hold = await tx.rentalHold.findUnique({ where: { bookingId } });
+
+               if (!hold || hold.carId !== carId) {
+                    throw new ConflictError('Hold expired or not found. Please book again.', 'LOCK_EXPIRED');
+               }
+               if (hold.lockedBy !== userId) {
+                    throw new ForbiddenError('This hold belongs to another user');
+               }
+               if (hold.status === 'BOOKED') {
+                    return { carId, bookingId, status: 'BOOKED' };
+               }
+
+               await tx.rentalHold.update({
+                    where: { bookingId },
+                    data: { status: 'BOOKED', lockExpiresAt: null, version: { increment: 1 } },
+               });
+
+               return { carId, bookingId, status: 'BOOKED' };
+          }, { timeout: 10000 });
+     });
+
+     await publishAvailability(carId);
+     return result;
+};
+
+const cancelBooking = async (carId, bookingId) => {
+     const deleted = await prisma.rentalHold.deleteMany({ where: { carId, bookingId } });
+
+     if (deleted.count === 0) {
+          throw new NotFoundError('No reservation found for this booking');
+     }
+
+     await publishAvailability(carId);
+     return { carId, bookingId, released: true };
 };
 
 module.exports = {
-     initializeInventory,
-     cancelScheduleInventory,
+     upsertCar,
+     handleCarStatusChanged,
      getAvailability,
-     getSeats,
-     lockSeats,
-     unlockSeats,
-     confirmSeats,
+     lockCar,
+     releaseCar,
+     reserveCarForTrip,
+     releaseCarReservation,
+     confirmCar,
      cancelBooking,
-     recountAndPublish,
-     recomputeSegmentSeatStatuses,
+     publishAvailability,
 };

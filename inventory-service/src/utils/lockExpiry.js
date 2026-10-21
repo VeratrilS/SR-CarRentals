@@ -1,7 +1,8 @@
 const prisma = require('../config/prisma');
 const logger = require('../config/logger');
 const { config } = require('../config');
-const { recountAndPublish, recomputeSegmentSeatStatuses } = require('../services/inventory.service');
+const { publishAvailability } = require('../services/inventory.service');
+const { cleanExpiredSeatHolds } = require('../services/trip.service');
 
 let intervalHandle = null;
 
@@ -32,6 +33,10 @@ async function releaseLeadership() {
      }
 }
 
+/**
+ * Remove LOCKED holds whose payment window has passed, then republish the
+ * availability of every affected car so search results free them up again.
+ */
 async function cleanExpiredLocks() {
      const isLeader = await tryAcquireLeadership();
      if (!isLeader) {
@@ -40,94 +45,31 @@ async function cleanExpiredLocks() {
      }
 
      try {
-          // --- SEGMENT BOOKING: Clean expired segment locks first ---
-          try {
-               const expiredSegmentLocks = await prisma.seatSegmentLock.findMany({
-                    where: { status: 'LOCKED', lockExpiresAt: { lt: new Date() } },
-                    select: { id: true, scheduleId: true, seatId: true },
-               });
+          // Shared-ride seats whose payment window passed
+          await cleanExpiredSeatHolds().catch((err) => logger.error('Seat hold cleanup failed', { error: err.message }));
 
-               if (expiredSegmentLocks.length > 0) {
-                    logger.info(`Found ${expiredSegmentLocks.length} expired segment lock(s) to clean up`);
+          const expiredHolds = await prisma.rentalHold.findMany({
+               where: { status: 'LOCKED', lockExpiresAt: { lt: new Date() } },
+               select: { id: true, carId: true },
+          });
 
-                    const segmentIds = expiredSegmentLocks.map(l => l.id);
-                    await prisma.$executeRaw`
-                         DELETE FROM seat_segment_locks WHERE id = ANY(${segmentIds}::text[])
-                    `;
+          if (expiredHolds.length === 0) return;
 
-                    // Group by scheduleId → Set<seatId> for recomputing SeatInventory
-                    const affectedScheduleSeats = new Map();
-                    for (const lock of expiredSegmentLocks) {
-                         if (!affectedScheduleSeats.has(lock.scheduleId)) {
-                              affectedScheduleSeats.set(lock.scheduleId, new Set());
-                         }
-                         affectedScheduleSeats.get(lock.scheduleId).add(lock.seatId);
-                    }
+          logger.info(`Found ${expiredHolds.length} expired hold(s) to clean up`);
 
-                    for (const [scheduleId, seatIdSet] of affectedScheduleSeats) {
-                         // Recompute each seat's summary status from remaining segment locks.
-                         // This correctly handles all transitions: LOCKED→AVAILABLE, LOCKED→BOOKED, etc.
-                         await prisma.$transaction(async (tx) => {
-                              await recomputeSegmentSeatStatuses(tx, scheduleId, [...seatIdSet]);
-                         });
-                         await recountAndPublish(scheduleId);
-                    }
-
-                    logger.info(`Cleaned ${expiredSegmentLocks.length} expired segment lock(s)`);
-               }
-          } catch (segErr) {
-               logger.error('Segment lock expiry cleanup failed', { error: segErr.message });
-          }
-          // --- END SEGMENT BOOKING ---
-
-          // Find all expired locked seats (original full-journey lock expiry)
-          const expiredSeats = await prisma.seatInventory.findMany({
+          await prisma.rentalHold.deleteMany({
                where: {
-                    status: 'LOCKED',
-                    lockExpiresAt: { lt: new Date() },
-               },
-               select: {
-                    id: true,
-                    scheduleId: true,
-                    seatNumber: true,
+                    id: { in: expiredHolds.map(h => h.id) },
+                    status: 'LOCKED', // never delete a hold that was confirmed meanwhile
                },
           });
 
-          if (expiredSeats.length === 0) return;
-
-          logger.info(`Found ${expiredSeats.length} expired seat lock(s) to clean up`);
-
-          // Group by scheduleId
-          const bySchedule = {};
-          for (const seat of expiredSeats) {
-               if (!bySchedule[seat.scheduleId]) bySchedule[seat.scheduleId] = [];
-               bySchedule[seat.scheduleId].push(seat);
+          const affectedCars = [...new Set(expiredHolds.map(h => h.carId))];
+          for (const carId of affectedCars) {
+               await publishAvailability(carId);
           }
 
-          for (const [scheduleId, seats] of Object.entries(bySchedule)) {
-               try {
-                    const seatPkIds = seats.map(s => s.id);
-
-                    // Release the expired locks
-                    await prisma.$executeRaw`
-                         UPDATE seat_inventories
-                         SET status = 'AVAILABLE', "lockedBy" = NULL,
-                             "lockedAt" = NULL, "lockExpiresAt" = NULL,
-                             version = version + 1, "updatedAt" = NOW()
-                         WHERE id = ANY(${seatPkIds}::text[])
-                         AND status = 'LOCKED'
-                    `;
-
-                    // Recount from actual seat rows to prevent counter drift
-                    await recountAndPublish(scheduleId);
-
-                    logger.info(`Released ${seats.length} expired lock(s) for schedule ${scheduleId}`);
-               } catch (err) {
-                    logger.error(`Failed to clean expired locks for schedule ${scheduleId}`, {
-                         error: err.message,
-                    });
-               }
-          }
+          logger.info(`Released expired holds on ${affectedCars.length} car(s)`);
      } catch (error) {
           logger.error('Lock expiry cleanup failed', { error: error.message });
      } finally {

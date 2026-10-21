@@ -1,18 +1,26 @@
-const { consumer, producer, connectProducer } = require('../../config/kafka');
+const { kafka, consumer, producer, connectProducer } = require('../../config/kafka');
 const emailService = require('../../services/email.service');
 const logger = require('../../config/logger');
 const { KAFKA_TOPICS } = require('../../../../shared/constants/kafka-topics');
 const { withDLQ } = require('../../../../shared/utils/dlqHandler');
+const { ensureTopics } = require('../../../../shared/utils/ensureTopics');
 
 class EmailConsumer {
      async start() {
           try {
+               await ensureTopics(kafka, logger);
                await consumer.connect();
                await connectProducer(); // needed for DLQ publishing
                logger.info('Email consumer connected to Kafka');
 
                await consumer.subscribe({
-                    topics: Object.values(KAFKA_TOPICS),
+                    topics: [
+                         KAFKA_TOPICS.OTP_EMAIL,
+                         KAFKA_TOPICS.WELCOME_EMAIL,
+                         KAFKA_TOPICS.BOOKING_CONFIRMED,
+                         KAFKA_TOPICS.BOOKING_FAILED,
+                         KAFKA_TOPICS.BOOKING_CANCELLED,
+                    ],
                     fromBeginning: false
                });
 

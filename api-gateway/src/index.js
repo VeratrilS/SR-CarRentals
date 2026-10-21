@@ -9,6 +9,7 @@ const errorHandler = require('./middlewares/error.middleware');
 const { notFound } = require('./middlewares/notFound.middleware');
 const { reqLogger } = require('./middlewares/req.middleware');
 const { corsMiddleware } = require('./middlewares/cors.middleware');
+const { stripIdentityHeaders } = require('./middlewares/auth.middleware');
 const routes = require('./routes');
 const app = express();
 
@@ -19,6 +20,7 @@ app.use(helmet({
      crossOriginEmbedderPolicy: false,
 }));
 app.use(reqLogger);
+app.use(stripIdentityHeaders);
 
 // Skip JSON parsing for Razorpay webhook — signature verification needs raw bytes
 app.use((req, res, next) => {

@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth } = require('../middlewares/auth.middleware');
+const { requireAuth, requireAdmin } = require('../middlewares/auth.middleware');
 const { createProxy, getCircuitBreakerStatus } = require('../services/proxy');
 const { ipRateLimit, endpointRateLimit, combinedRateLimit } = require('../middlewares/rateLimiting.middleware')
 const { config } = require('../config');
@@ -44,6 +44,12 @@ router.post(
 );
 
 router.post(
+     '/users/auth/logout',
+     endpointRateLimit(30, 900000), // 30 requests per 15 minutes
+     userServiceProxy
+);
+
+router.post(
      '/users/auth/refresh',
      endpointRateLimit(20, 900000), // 20 requests per 15 minutes
      userServiceProxy
@@ -71,64 +77,49 @@ router.delete(
      userServiceProxy
 )
 
+// ===========================
+// ADMIN SERVICE ROUTES (fleet management — ADMIN role only)
+// ===========================
 const adminServiceProxy = createProxy('adminService', config.SERVICES.ADMIN_SERVICE_URL);
+const adminOnly = [requireAuth, requireAdmin, combinedRateLimit()];
 
-router.post(
-     '/admins/stations/station',
-     requireAuth,
-     combinedRateLimit(),
-     adminServiceProxy
-);
+router.post('/admins/branches/branch', ...adminOnly, adminServiceProxy);
+router.get('/admins/branches/branch', ...adminOnly, adminServiceProxy);
+router.get('/admins/branches/branch/:branchId', ...adminOnly, adminServiceProxy);
 
-router.post(
-     '/admins/trains/train',
-     requireAuth,
-     combinedRateLimit(),
-     adminServiceProxy
-);
+router.post('/admins/cars/car', ...adminOnly, adminServiceProxy);
+router.get('/admins/cars/car', ...adminOnly, adminServiceProxy);
+router.get('/admins/cars/car/:carId', ...adminOnly, adminServiceProxy);
+router.put('/admins/cars/car/:carId', ...adminOnly, adminServiceProxy);
+router.patch('/admins/cars/car/:carId/status', ...adminOnly, adminServiceProxy);
 
-router.post(
-     '/admins/trains/route',
-     requireAuth,
-     combinedRateLimit(),
-     adminServiceProxy
-)
+// Shared rides: routes + scheduled trips
+router.post('/admins/rides/route', ...adminOnly, adminServiceProxy);
+router.get('/admins/rides/route', ...adminOnly, adminServiceProxy);
+router.post('/admins/rides/trip', ...adminOnly, adminServiceProxy);
+router.get('/admins/rides/trip', ...adminOnly, adminServiceProxy);
+router.patch('/admins/rides/trip/:tripId/cancel', ...adminOnly, adminServiceProxy);
 
-router.post(
-     '/admins/schedules/schedule',
-     requireAuth,
-     combinedRateLimit(),
-     adminServiceProxy
-)
-
-router.get(
-     '/admins/stations/station',
-     requireAuth,
-     combinedRateLimit(),
-     adminServiceProxy
-)
-
-router.get(
-     '/admins/trains/train/:trainId',
-     requireAuth,
-     combinedRateLimit(),
-     adminServiceProxy
-);
-
-router.put(
-     '/admins/schedules/schedule/:scheduleId',
-     requireAuth,
-     combinedRateLimit(),
-     adminServiceProxy
-)
 // ===========================
 // SEARCH SERVICE ROUTES (public - no auth required)
 // ===========================
 const searchServiceProxy = createProxy('searchService', config.SERVICES.SEARCH_SERVICE_URL);
 
 router.get(
-     '/search/trains',
+     '/search/cars',
      endpointRateLimit(60, 60000), // 60 requests per minute
+     searchServiceProxy
+);
+
+router.get(
+     '/search/rides',
+     endpointRateLimit(60, 60000), // 60 requests per minute
+     searchServiceProxy
+);
+
+router.get(
+     '/search/locations',
+     endpointRateLimit(120, 60000), // 120 requests per minute
      searchServiceProxy
 );
 
@@ -143,28 +134,43 @@ router.get(
 // ===========================
 const inventoryServiceProxy = createProxy('inventoryService', config.SERVICES.INVENTORY_SERVICE_URL);
 
-// Public: aggregate availability (used by search results)
+// Public: a car's booked periods + whether a requested window is free
 router.get(
-     '/inventory/schedules/:scheduleId/availability',
+     '/inventory/cars/:carId/availability',
      endpointRateLimit(120, 60000), // 120 requests per minute
      inventoryServiceProxy
 );
 
-// Authenticated: individual seat statuses
+// Public: seat map of a shared-ride trip (optionally for a stretch)
 router.get(
-     '/inventory/schedules/:scheduleId/seats',
-     requireAuth,
-     combinedRateLimit(),
+     '/inventory/trips/:tripId/seats',
+     endpointRateLimit(120, 60000), // 120 requests per minute
      inventoryServiceProxy
 );
 
-// Note: lock/unlock/confirm/cancel-booking are now internal-only
+// Note: hold/release/confirm/cancel-booking are internal-only
 // (called by booking-service directly, not through the gateway)
 
 // ===========================
 // BOOKING SERVICE ROUTES
 // ===========================
 const bookingServiceProxy = createProxy('bookingService', config.SERVICES.BOOKING_SERVICE_URL);
+
+// Price quote for a car + window (no side effects)
+router.get(
+     '/bookings/bookings/quote',
+     requireAuth,
+     combinedRateLimit(),
+     bookingServiceProxy
+);
+
+// Price quote for seats on a shared ride
+router.get(
+     '/bookings/bookings/seat-quote',
+     requireAuth,
+     combinedRateLimit(),
+     bookingServiceProxy
+);
 
 router.post(
      '/bookings/bookings',

@@ -1,20 +1,28 @@
 import client from './client';
 
 export const adminApi = {
-  createStation: (data) => client.post('/admins/stations/station', data).then((r) => r.data),
-  getStations: (page = 1, limit = 20, search = '') => {
-    let url = `/admins/stations/station?page=${page}&limit=${limit}`;
-    if (search) url += `&search=${encodeURIComponent(search)}`;
-    return client.get(url).then((r) => r.data);
+  createBranch: (data) => client.post('/admins/branches/branch', data).then((r) => r.data),
+  getBranches: (page = 1, limit = 20, search = '') => {
+    const qs = new URLSearchParams({ page, limit });
+    if (search) qs.set('search', search);
+    return client.get(`/admins/branches/branch?${qs}`).then((r) => r.data);
   },
 
-  createTrain: (data) => client.post('/admins/trains/train', data).then((r) => r.data),
-  getTrains: () => client.get('/admins/trains/train').then((r) => r.data),
-  getTrainById: (id) => client.get(`/admins/trains/train/${id}`).then((r) => r.data),
+  createCar: (data) => client.post('/admins/cars/car', data).then((r) => r.data),
+  getCars: (query = {}) => {
+    const qs = new URLSearchParams(Object.entries(query).filter(([, v]) => v));
+    return client.get(`/admins/cars/car${qs.toString() ? '?' + qs : ''}`).then((r) => r.data);
+  },
+  updateCar: (id, data) => client.put(`/admins/cars/car/${id}`, data).then((r) => r.data),
+  // Shared rides
+  createRoute: (data) => client.post('/admins/rides/route', data).then((r) => r.data),
+  getRoutes: () => client.get('/admins/rides/route').then((r) => r.data),
+  scheduleTrip: (data) => client.post('/admins/rides/trip', data).then((r) => r.data),
+  getTrips: (query = {}) => {
+    const qs = new URLSearchParams(Object.entries(query).filter(([, v]) => v));
+    return client.get(`/admins/rides/trip${qs.toString() ? '?' + qs : ''}`).then((r) => r.data);
+  },
+  cancelTrip: (id) => client.patch(`/admins/rides/trip/${id}/cancel`).then((r) => r.data),
 
-  createRoute: (data) => client.post('/admins/trains/route', data).then((r) => r.data),
-
-  createSchedule: (data) => client.post('/admins/schedules/schedule', data).then((r) => r.data),
-  getSchedules: (query = '') => client.get(`/admins/schedules/schedule${query ? '?' + query : ''}`).then((r) => r.data),
-  cancelSchedule: (id) => client.put(`/admins/schedules/schedule/${id}`).then((r) => r.data),
+  setCarStatus: (id, status) => client.patch(`/admins/cars/car/${id}/status`, { status }).then((r) => r.data),
 };

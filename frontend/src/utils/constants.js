@@ -1,30 +1,43 @@
-export const SEAT_TYPES = ['LOWER', 'MIDDLE', 'UPPER', 'SIDE_LOWER', 'SIDE_UPPER'];
+export const APP_NAME = 'SR-CarRentals';
 
-export const SEAT_TYPE_LABELS = {
-  LOWER: 'Lower',
-  MIDDLE: 'Middle',
-  UPPER: 'Upper',
-  SIDE_LOWER: 'Side Lower',
-  SIDE_UPPER: 'Side Upper',
+export const CAR_CATEGORIES = ['HATCHBACK', 'SEDAN', 'SUV', 'MUV', 'LUXURY'];
+
+export const CATEGORY_LABELS = {
+  HATCHBACK: 'Hatchback',
+  SEDAN: 'Sedan',
+  SUV: 'SUV',
+  MUV: 'MUV / 7-seater',
+  LUXURY: 'Luxury',
 };
 
-export const SEAT_STATUS_COLORS = {
-  AVAILABLE: 'bg-green-500',
-  LOCKED: 'bg-yellow-500',
-  BOOKED: 'bg-red-400',
-  SELECTED: 'bg-blue-500',
+export const CATEGORY_ICONS = {
+  HATCHBACK: '🚗',
+  SEDAN: '🚘',
+  SUV: '🚙',
+  MUV: '🚐',
+  LUXURY: '🏎️',
 };
 
-export const BOOKING_STATUS_COLORS = {
-  PENDING: 'bg-yellow-100 text-yellow-800',
-  SEATS_HELD: 'bg-yellow-100 text-yellow-800',
-  PAYMENT_PENDING: 'bg-orange-100 text-orange-800',
-  CONFIRMING: 'bg-blue-100 text-blue-800',
-  CONFIRMED: 'bg-green-100 text-green-800',
-  CANCELLING: 'bg-red-100 text-red-800',
-  FAILED: 'bg-red-100 text-red-800',
-  CANCELLED: 'bg-gray-100 text-gray-800',
-  EXPIRED: 'bg-gray-100 text-gray-800',
+export const TRANSMISSIONS = ['MANUAL', 'AUTOMATIC'];
+export const FUEL_TYPES = ['PETROL', 'DIESEL', 'CNG', 'ELECTRIC', 'HYBRID'];
+export const CAR_STATUSES = ['ACTIVE', 'MAINTENANCE', 'RETIRED'];
+
+export const SORT_OPTIONS = [
+  { value: 'price_asc', label: 'Price: low to high' },
+  { value: 'price_desc', label: 'Price: high to low' },
+  { value: 'newest', label: 'Newest models' },
+  { value: 'seats', label: 'Most seats' },
+];
+
+export const BOOKING_REASON_MESSAGES = {
+  user_cancelled: 'You cancelled this booking.',
+  car_unavailable: 'The car was taken off the fleet (maintenance). You were not charged, or have been fully refunded.',
+  booking_timeout: 'Payment was not completed in time, so the car was released.',
+  payment_failed: 'The payment did not go through.',
+  late_payment: 'Payment arrived after the hold expired and has been refunded.',
 };
 
-export const MAX_SEATS_PER_BOOKING = 6;
+// Mirrors booking-service pricing rules (the server quote is authoritative)
+export const LONG_RENTAL_MIN_DAYS = 7;
+export const LONG_RENTAL_DISCOUNT_PCT = 10;
+export const FREE_CANCELLATION_HOURS = 24;

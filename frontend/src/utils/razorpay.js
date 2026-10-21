@@ -26,13 +26,13 @@ export function openRazorpayCheckout({ keyId, orderId, amount, currency, booking
     amount,
     currency: currency || 'INR',
     order_id: orderId,
-    name: 'IRCTC Booking',
-    description: bookingDescription || 'Train Ticket Booking',
+    name: 'SR-CarRentals',
+    description: bookingDescription || 'Self-drive car rental',
     prefill: {
       name: user ? `${user.firstName || ''} ${user.lastName || ''}`.trim() : '',
       email: user?.email || '',
     },
-    theme: { color: '#1a237e' },
+    theme: { color: '#0f766e' },
     handler: (response) => onSuccess(response),
     modal: { ondismiss: onDismiss },
   };

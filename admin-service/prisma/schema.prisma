@@ -1,113 +1,143 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
-  // output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
 }
 
-model Station {
+// A rental location where cars are picked up and dropped off
+model Branch {
   id        String   @id @default(uuid())
-  name      String   @unique // "New Delhi"
-  code      String   @unique // "NDLS"
-  city      String // "Delhi"
+  name      String   @unique // "Hitech City"
+  code      String   @unique // "HYD-HTC"
+  city      String // "Hyderabad"
   state     String?
+  address   String?
+  openTime  String   @default("08:00")
+  closeTime String   @default("22:00")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  routeStations RouteStation[]
+  cars       Car[]
+  routeStops RouteStop[]
 
   @@index([name])
   @@index([code])
-  @@map("stations")
+  @@index([city])
+  @@map("branches")
 }
 
-model Train {
-  id          String   @id @default(uuid())
-  trainNumber String   @unique // "12301"
-  trainName   String // "Rajdhani Express"
-  coachName   String   @default("AC") // Single coach per train (simplified)
-  totalSeats  Int // Total seats in the single coach
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  seats     Seat[]
-  route     Route?
-  schedules Schedule[]
-
-  @@map("trains")
+enum CarCategory {
+  HATCHBACK
+  SEDAN
+  SUV
+  MUV
+  LUXURY
 }
 
-enum SeatType {
-  LOWER
-  MIDDLE
-  UPPER
-  SIDE_LOWER
-  SIDE_UPPER
+enum Transmission {
+  MANUAL
+  AUTOMATIC
 }
 
-model Seat {
-  id         String   @id @default(uuid())
-  trainId    String
-  seatNumber Int // 1, 2, 3...
-  seatType   SeatType // LOWER, MIDDLE, UPPER etc
-  price      Float // Price for this seat type
-
-  train Train @relation(fields: [trainId], references: [id], onDelete: Cascade)
-
-  @@unique([trainId, seatNumber])
-  @@map("seats")
+enum FuelType {
+  PETROL
+  DIESEL
+  CNG
+  ELECTRIC
+  HYBRID
 }
 
+enum CarStatus {
+  ACTIVE // available for rent
+  MAINTENANCE // temporarily off the fleet — future bookings are cancelled
+  RETIRED // permanently removed
+}
+
+// A physical vehicle in the fleet
+model Car {
+  id                 String       @id @default(uuid())
+  registrationNumber String       @unique // "TS09AB1234"
+  make               String // "Hyundai"
+  model              String // "Creta"
+  year               Int
+  category           CarCategory
+  transmission       Transmission
+  fuelType           FuelType
+  seats              Int
+  dailyRate          Float // price per 24h in INR
+  imageUrl           String?
+  status             CarStatus    @default(ACTIVE)
+  branchId           String
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id])
+  trips  Trip[]
+
+  @@index([branchId, status])
+  @@index([category])
+  @@map("cars")
+}
+
+// ─── Shared rides ─────────────────────────────────────────────────────────────
+
+// An ordered list of branches a shared ride passes through,
+// e.g. Hyderabad (0 km) → Suryapet (135 km) → Vijayawada (275 km)
 model Route {
-  id      String @id @default(uuid())
-  trainId String @unique
+  id        String   @id @default(uuid())
+  name      String   @unique // "Hyderabad → Vijayawada"
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  train         Train          @relation(fields: [trainId], references: [id], onDelete: Cascade)
-  routeStations RouteStation[]
+  stops RouteStop[]
+  trips Trip[]
 
   @@map("routes")
 }
 
-model RouteStation {
-  id                 String  @id @default(uuid())
-  routeId            String
-  stationId          String
-  sequenceNumber     Int // 1, 2, 3... order of station in route
-  arrivalTime        String? // "06:00"
-  departureTime      String? // "06:10" (null for last station)
-  distanceFromOrigin Float   @default(0) // in km, for pricing calculation
+model RouteStop {
+  id            String @id @default(uuid())
+  routeId       String
+  branchId      String
+  sequence      Int // 1, 2, 3… order along the route
+  offsetMinutes Int // minutes after departure that the car reaches this stop
+  distanceKm    Float // distance from the first stop
 
-  route   Route   @relation(fields: [routeId], references: [id], onDelete: Cascade)
-  station Station @relation(fields: [stationId], references: [id], onDelete: Cascade)
+  route  Route  @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id])
 
-  @@unique([routeId, sequenceNumber])
-  @@unique([routeId, stationId])
-  @@map("route_stations")
+  @@unique([routeId, sequence])
+  @@unique([routeId, branchId])
+  @@map("route_stops")
 }
 
-model Schedule {
-  id            String         @id @default(uuid())
-  trainId       String
-  departureDate DateTime       @db.Date // The date this train runs
-  status        ScheduleStatus @default(ACTIVE)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
-
-  train Train @relation(fields: [trainId], references: [id], onDelete: Cascade)
-
-  @@unique([trainId, departureDate])
-  @@map("schedules")
-}
-
-enum ScheduleStatus {
-  ACTIVE
+enum TripStatus {
+  SCHEDULED
   CANCELLED
+}
+
+// One run of a car along a route at a fixed time; passengers book seats on it
+model Trip {
+  id          String     @id @default(uuid())
+  routeId     String
+  carId       String
+  departureAt DateTime
+  arrivalAt   DateTime
+  driverName  String
+  farePerKm   Float // seat price = distance travelled × farePerKm (min fare applies)
+  status      TripStatus @default(SCHEDULED)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  route Route @relation(fields: [routeId], references: [id])
+  car   Car   @relation(fields: [carId], references: [id])
+
+  @@index([departureAt, status])
+  @@index([carId, status])
+  @@map("trips")
 }

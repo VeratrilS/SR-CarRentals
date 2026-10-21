@@ -4,9 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>IRCTC - Indian Railways</title>
+    <title>SR-CarRentals — Car rentals & shared rides</title>
+    <meta name="description" content="Rent a self-drive car by the day, or book a seat on a shared ride between cities." />
+    <meta name="theme-color" content="#134e4a" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <script>
+      // Apply the saved (or system) theme before first paint to avoid a light flash
+      (function () {
+        try {
+          var pref = localStorage.getItem('sr-carrentals-theme') || 'system';
+          var dark = pref === 'dark' || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark');
+        } catch (e) {}
+      })();
+    </script>
   </head>
-  <body class="bg-gray-50 text-gray-900 antialiased">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>

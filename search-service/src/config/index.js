@@ -7,6 +7,11 @@ const config = {
      KAFKA_BROKER: process.env.KAFKA_BROKER,
      KAFKA_CLIENT_ID: process.env.KAFKA_CLIENT_ID,
      ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
+
+     // Shared-ride search asks inventory for live seats-left per stretch
+     INVENTORY_SERVICE_URL: process.env.INVENTORY_SERVICE_URL || 'http://localhost:4007',
+     INTERNAL_SERVICE_KEY: process.env.INTERNAL_SERVICE_KEY,
+     TIME_ZONE: process.env.TIME_ZONE || 'Asia/Kolkata',
 }
 
 module.exports = { config };

@@ -3,49 +3,59 @@ import { bookingApi } from '../api/booking.api';
 
 const TERMINAL_STATUSES = ['CONFIRMED', 'CANCELLED', 'FAILED', 'EXPIRED'];
 const POLL_INTERVAL = 3000;
-const MAX_POLLS = 20;
+const MAX_POLLS = 40;              // ~2 minutes of watching an in-progress booking
+const MAX_CONSECUTIVE_ERRORS = 3;  // tolerate brief network blips while polling
 
+/**
+ * Loads a booking and keeps polling while it is still in progress.
+ * `refresh()` reloads immediately and restarts polling (e.g. after a payment attempt).
+ */
 export function useBookingPolling(bookingId) {
   const [booking, setBooking] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const pollCount = useRef(0);
+  const errorCount = useRef(0);
   const intervalRef = useRef(null);
+
+  const stop = () => clearInterval(intervalRef.current);
 
   const fetchBooking = useCallback(async () => {
     try {
       const res = await bookingApi.getById(bookingId);
       const data = res.data || res;
       setBooking(data);
+      setError(null);
       setLoading(false);
-
-      if (TERMINAL_STATUSES.includes(data.status)) {
-        clearInterval(intervalRef.current);
-        return;
-      }
+      errorCount.current = 0;
 
       pollCount.current += 1;
-      if (pollCount.current >= MAX_POLLS) {
-        clearInterval(intervalRef.current);
-      }
+      if (TERMINAL_STATUSES.includes(data.status) || pollCount.current >= MAX_POLLS) stop();
     } catch (err) {
-      setError(err.message);
+      errorCount.current += 1;
       setLoading(false);
-      clearInterval(intervalRef.current);
+      // A 404/403 is final; for network/server errors keep trying a few times
+      if (err.status === 404 || err.status === 403 || err.sessionExpired || errorCount.current >= MAX_CONSECUTIVE_ERRORS) {
+        setError(err);
+        stop();
+      }
     }
   }, [bookingId]);
 
-  useEffect(() => {
-    if (!bookingId) return;
+  const start = useCallback(() => {
+    stop();
     pollCount.current = 0;
-    setLoading(true);
+    errorCount.current = 0;
     fetchBooking();
-
     intervalRef.current = setInterval(fetchBooking, POLL_INTERVAL);
-    return () => clearInterval(intervalRef.current);
-  }, [bookingId, fetchBooking]);
+  }, [fetchBooking]);
 
-  const refresh = () => fetchBooking();
+  useEffect(() => {
+    if (!bookingId) return undefined;
+    setLoading(true);
+    start();
+    return stop;
+  }, [bookingId, start]);
 
-  return { booking, loading, error, refresh };
+  return { booking, loading, error, refresh: start };
 }

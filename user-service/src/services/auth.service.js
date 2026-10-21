@@ -1,6 +1,6 @@
 const { ConflictError, BadRequestError, ForbiddenError, UnauthorizedError } = require("../utils/error")
 const {generateAndStoreOtp, verifyOtp} = require('../utils/otp');
-const {generateAccessToken, generateRefreshToken, verifyRefreshToken} = require('../utils/auth');
+const {generateAccessToken, generateRefreshToken, verifyRefreshToken, roleFor} = require('../utils/auth');
 const notificationProducer = require('../kafka/producer/notification.producer')
 const bcrypt = require('bcrypt');
 const prisma = require('../config/prisma');
@@ -24,6 +24,12 @@ const sendOTP = async(firstName, lastName, email, password) =>{
      const {otp, otpSessionId} = await generateAndStoreOtp(meta);
      await notificationProducer.sendOtpEmail(email, otp, (config.OTP_TTL) / 60);
      logger.info(`OTP email queued for : ${email}`);
+
+     // Local development only: email delivery can fail (e.g. sender domain DMARC),
+     // so optionally echo the code to the service log. Never enabled in production.
+     if (config.LOG_OTP_IN_DEV && config.NODE_ENV !== 'production') {
+          logger.warn(`[DEV ONLY] OTP for ${email}: ${otp}`);
+     }
      return {otpSessionId}
 }
 
@@ -65,11 +71,13 @@ const login = async(email, password, deviceId) =>{
      if(!doesPasswordMatch){
           throw new UnauthorizedError("Invalid email or password", "INVALID_CREDENTIALS");
      }
-     const accessToken = generateAccessToken(existingUser.id);
+     const role = roleFor(existingUser.email);
+     const accessToken = generateAccessToken(existingUser.id, role);
      const refreshToken = generateRefreshToken(existingUser.id);
      const {jti} = jwt.decode(refreshToken);
      await redis.set(`refresh:${existingUser.id}:${deviceId}`, jti, 'EX', config.REFRESH_TOKEN_EXP_SEC);
-     const {password: _password, ...safeUser} = existingUser;
+     const {password: _password, ...rest} = existingUser;
+     const safeUser = {...rest, role};
      await redis.set(`user:${existingUser.id}`, JSON.stringify(safeUser), 'EX', config.REDIS_USER_TTL);
      return {accessToken, refreshToken, loggedInUser: safeUser};
 }
@@ -86,11 +94,30 @@ const rotateRefreshToken = async(refreshToken, deviceId) =>{
           await redis.del(`refresh:${userId}:${deviceId}`);
           throw new ForbiddenError("Refresh token reused", "LOGIN AGAIN")
      }
-     const newAccessToken = generateAccessToken(payload.id);
+     const user = await prisma.user.findUnique({ where: { id: payload.id }, select: { email: true } });
+     if(!user){
+          throw new ForbiddenError("User no longer exists", "LOGIN AGAIN")
+     }
+     const newAccessToken = generateAccessToken(payload.id, roleFor(user.email));
      const newRefreshToken = generateRefreshToken(payload.id);
      const {jti: newJti} = jwt.decode(newRefreshToken);
      await redis.set(`refresh:${payload.id}:${deviceId}`, newJti, 'EX', config.REFRESH_TOKEN_EXP_SEC);
      return {newAccessToken, newRefreshToken};
+}
+
+/**
+ * Revoke this device's refresh session. Best-effort: an invalid/expired token
+ * still results in a clean logout (cookies are cleared by the controller).
+ */
+const logout = async(refreshToken, deviceId) =>{
+     if(!refreshToken) return;
+     try {
+          const {id: userId} = verifyRefreshToken(refreshToken);
+          await redis.del(`refresh:${userId}:${deviceId}`);
+          logger.info(`User ${userId} logged out`);
+     } catch (err) {
+          logger.info('Logout with invalid or expired refresh token', { error: err.message });
+     }
 }
 
 const verifyGoogleIdToken = async(idToken, deviceId) =>{
@@ -160,13 +187,15 @@ const verifyGoogleIdToken = async(idToken, deviceId) =>{
           })
      })
 
-     const accessToken = generateAccessToken(user.id);
+     const role = roleFor(user.email);
+     const accessToken = generateAccessToken(user.id, role);
      const refreshToken = generateRefreshToken(user.id);
      const {jti} = jwt.decode(refreshToken);
      await redis.set(`refresh:${user.id}:${deviceId}`, jti, 'EX', config.REFRESH_TOKEN_EXP_SEC);
-     const {password: _password, ...safeUser} = user;
+     const {password: _password, ...rest} = user;
+     const safeUser = {...rest, role};
      await redis.set(`user:${user.id}`, JSON.stringify(safeUser), 'EX', config.REDIS_USER_TTL);
      return {accessToken, refreshToken, loggedInUser: safeUser};
      
 }
-module.exports = {sendOTP, verifyOTP, login, rotateRefreshToken, verifyGoogleIdToken}
+module.exports = {sendOTP, verifyOTP, login, rotateRefreshToken, verifyGoogleIdToken, logout}

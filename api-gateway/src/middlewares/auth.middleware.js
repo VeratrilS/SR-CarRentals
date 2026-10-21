@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { config } = require('../config');
-const { UnauthorizedError } = require('../utils/error');
+const { UnauthorizedError, ForbiddenError } = require('../utils/error');
 const logger = require('../config/logger');
 
 /**
@@ -37,10 +37,12 @@ function requireAuth(req, res, next) {
           // Attach user context to request for downstream services
           req.user = {
                id: payload.id,
+               role: payload.role || 'USER',
           };
 
-          // Add user ID to headers for proxied requests
+          // Add user context to headers for proxied requests
           req.headers['x-user-id'] = payload.id.toString();
+          req.headers['x-user-role'] = req.user.role;
 
           logger.debug(`User ${payload.id} authenticated successfully`);
 
@@ -56,4 +58,25 @@ function requireAuth(req, res, next) {
      }
 }
 
-module.exports = { requireAuth };
+/**
+ * Must run after requireAuth. Only tokens carrying role=ADMIN may pass.
+ */
+function requireAdmin(req, res, next) {
+     if (req.user?.role !== 'ADMIN') {
+          return next(new ForbiddenError('Admin access required'));
+     }
+     next();
+}
+
+/**
+ * Drop identity headers sent by the client. Only the gateway may set them
+ * (after verifying the JWT), otherwise a caller could impersonate any user
+ * on downstream services that trust x-user-id.
+ */
+function stripIdentityHeaders(req, res, next) {
+     delete req.headers['x-user-id'];
+     delete req.headers['x-user-role'];
+     next();
+}
+
+module.exports = { requireAuth, requireAdmin, stripIdentityHeaders };

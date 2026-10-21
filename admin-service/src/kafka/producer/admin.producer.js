@@ -39,43 +39,47 @@ class AdminProducer {
      }
 
 
-     async publishStationCreated(station) {
+     async publishBranchCreated(branch) {
           return this.sendMessage(
-               KAFKA_TOPICS.STATION_CREATED,
-               `station-${station.id}`,
-               { eventType: 'STATION_CREATED', data: station, timestamp: new Date().toISOString() }
+               KAFKA_TOPICS.BRANCH_CREATED,
+               `branch-${branch.id}`,
+               { eventType: 'BRANCH_CREATED', data: branch, timestamp: new Date().toISOString() }
           );
      }
 
-     async publishTrainCreated(trainData) {
+     async publishCarCreated(carEvent) {
           return this.sendMessage(
-               KAFKA_TOPICS.TRAIN_CREATED,
-               `train-${trainData.id}`,
-               trainData
+               KAFKA_TOPICS.CAR_CREATED,
+               `car-${carEvent.carId}`,
+               carEvent
           );
      }
 
-     async publishRouteCreated(routeData) {
+     async publishCarUpdated(carEvent) {
           return this.sendMessage(
-               KAFKA_TOPICS.ROUTE_CREATED,
-               `route-${routeData.id}`,
-               routeData
+               KAFKA_TOPICS.CAR_UPDATED,
+               `car-${carEvent.carId}`,
+               carEvent
           );
      }
 
-     async publishScheduleCreated(scheduleData) {
+     async publishTripScheduled(tripEvent) {
+          return this.sendMessage(KAFKA_TOPICS.TRIP_SCHEDULED, `trip-${tripEvent.tripId}`, tripEvent);
+     }
+
+     async publishTripCancelled(event) {
           return this.sendMessage(
-               KAFKA_TOPICS.SCHEDULE_CREATED,
-               `schedule-${scheduleData.scheduleId}`,
-               scheduleData
+               KAFKA_TOPICS.TRIP_CANCELLED,
+               `trip-${event.tripId}`,
+               { ...event, timestamp: new Date().toISOString() }
           );
      }
 
-     async publishScheduleCancelled(schedule) {
+     async publishCarStatusChanged(statusEvent) {
           return this.sendMessage(
-               KAFKA_TOPICS.SCHEDULE_CANCELLED,
-               `schedule-${schedule.id}`,
-               { eventType: 'SCHEDULE_CANCELLED', data: schedule, timestamp: new Date().toISOString() }
+               KAFKA_TOPICS.CAR_STATUS_CHANGED,
+               `car-${statusEvent.carId}`,
+               { ...statusEvent, timestamp: new Date().toISOString() }
           );
      }
 }

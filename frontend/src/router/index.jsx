@@ -4,6 +4,7 @@ import ProtectedRoute from './ProtectedRoute';
 import HomePage from '../pages/HomePage';
 import LoginPage from '../pages/LoginPage';
 import SearchPage from '../pages/SearchPage';
+import RidesPage from '../pages/RidesPage';
 import SeatSelectionPage from '../pages/SeatSelectionPage';
 import BookingPage from '../pages/BookingPage';
 import BookingDetailPage from '../pages/BookingDetailPage';
@@ -18,12 +19,16 @@ export default function AppRouter() {
         <Route path="/" element={<HomePage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/search" element={<SearchPage />} />
+        <Route path="/rides" element={<RidesPage />} />
 
         <Route element={<ProtectedRoute />}>
-          <Route path="/seats/:scheduleId" element={<SeatSelectionPage />} />
-          <Route path="/booking" element={<BookingPage />} />
+          <Route path="/book/:carId" element={<BookingPage />} />
+          <Route path="/rides/:tripId" element={<SeatSelectionPage />} />
           <Route path="/bookings" element={<MyBookingsPage />} />
           <Route path="/bookings/:bookingId" element={<BookingDetailPage />} />
+        </Route>
+
+        <Route element={<ProtectedRoute requireAdmin />}>
           <Route path="/admin" element={<AdminPage />} />
         </Route>
 

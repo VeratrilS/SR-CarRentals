@@ -10,7 +10,7 @@ const kafka = new Kafka({
 });
 
 const consumer = kafka.consumer({
-     groupId: 'search-service-group-v2',
+     groupId: 'search-service-group',
      sessionTimeout: 30000,
      heartbeatInterval: 3000,
 });

@@ -14,6 +14,7 @@ const prisma = require('./config/prisma');
 const inventoryRoutes = require('./routes/inventory.route');
 const inventoryConsumer = require('./kafka/consumer/inventory.consumer');
 const { startLockExpiryJob, stopLockExpiryJob } = require('./utils/lockExpiry');
+const { ensureDbConstraints } = require('./config/dbConstraints');
 
 const app = express();
 
@@ -57,6 +58,7 @@ app.use(errorHandler);
 
 const startServer = async () => {
      try {
+          await ensureDbConstraints();
           await inventoryConsumer.start();
           startLockExpiryJob();
 
