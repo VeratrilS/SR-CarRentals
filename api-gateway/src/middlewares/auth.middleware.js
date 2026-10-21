@@ -28,7 +28,8 @@ function requireAuth(req, res, next) {
           }
 
           // Verify access token
-          const payload = jwt.verify(accessToken, config.JWT_ACCESS_SECRET);
+          // Pin the algorithm so a token can't pick a weaker one in its header
+          const payload = jwt.verify(accessToken, config.JWT_ACCESS_SECRET, { algorithms: ['HS256'] });
 
           if (!payload.id) {
                throw new UnauthorizedError('Invalid token payload');
@@ -51,7 +52,8 @@ function requireAuth(req, res, next) {
           if (err.name === 'TokenExpiredError') {
                return next(new UnauthorizedError('Access token expired', 'TOKEN_EXPIRED'));
           }
-          if (err.name === 'JsonWebTokenError') {
+          // Covers JsonWebTokenError and NotBeforeError (both subclasses)
+          if (err instanceof jwt.JsonWebTokenError) {
                return next(new UnauthorizedError('Invalid access token', 'TOKEN_INVALID'));
           }
           return next(err);
@@ -76,6 +78,7 @@ function requireAdmin(req, res, next) {
 function stripIdentityHeaders(req, res, next) {
      delete req.headers['x-user-id'];
      delete req.headers['x-user-role'];
+     delete req.headers['x-internal-service-key'];
      next();
 }
 

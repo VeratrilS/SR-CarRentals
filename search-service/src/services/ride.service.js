@@ -2,6 +2,7 @@ const { esClient, TRIP_INDEX, BRANCH_INDEX } = require('../config/elasticsearch'
 const { config } = require('../config');
 const logger = require('../config/logger');
 const { resolveLocation } = require('./search.service');
+const { BoolQueryBuilder } = require('../utils/boolQueryBuilder');
 
 const MIN_SEAT_FARE = 100;                      // mirrors booking-service pricing
 const SALES_CUTOFF_MS = 30 * 60 * 1000;         // stop selling 30 min before boarding
@@ -105,16 +106,16 @@ const searchRides = async ({ from, to, date, seats = 1 }) => {
      const result = await esClient.search({
           index: TRIP_INDEX,
           size: 100,
-          query: {
-               bool: {
-                    filter: [
-                         { term: { status: 'SCHEDULED' } },
-                         { range: { departureAt: { gte: new Date(day.getTime() - 864e5).toISOString(), lt: new Date(day.getTime() + 2 * 864e5).toISOString() } } },
-                         { nested: { path: 'stops', query: { terms: { 'stops.branchId': origin.ids } }, inner_hits: { name: 'from', size: 10 } } },
-                         { nested: { path: 'stops', query: { terms: { 'stops.branchId': destination.ids } }, inner_hits: { name: 'to', size: 10 } } },
-                    ],
-               },
-          },
+          query: new BoolQueryBuilder()
+               .term('status', 'SCHEDULED')
+               .range('departureAt', {
+                    gte: new Date(day.getTime() - 864e5).toISOString(),
+                    lt: new Date(day.getTime() + 2 * 864e5).toISOString(),
+               })
+               // The same trip must stop at the origin AND at the destination
+               .nested('stops', { terms: { 'stops.branchId': origin.ids } }, 'from')
+               .nested('stops', { terms: { 'stops.branchId': destination.ids } }, 'to')
+               .build(),
      });
 
      const candidates = [];

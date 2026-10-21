@@ -24,7 +24,7 @@ class NotificationProducer {
                     messages: [{
                          key: key || `${topic}-${Date.now()}`,
                          value: JSON.stringify(value),
-                         timeStamp: Date.now().toString()
+                         timestamp: Date.now().toString()
                     }]
                }
 

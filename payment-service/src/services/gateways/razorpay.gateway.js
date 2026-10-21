@@ -30,8 +30,13 @@ class RazorpayGateway extends BaseGateway {
                // Razorpay SDK throws plain objects, not Error instances
                const description = err?.error?.description || err?.message || JSON.stringify(err);
                logger.error(`Razorpay createOrder failed: ${description}`);
-               const { BadRequestError } = require('../../utils/error');
-               throw new BadRequestError(`Payment gateway error: ${description}`, 'PAYMENT_GATEWAY_ERROR');
+               const { AppError } = require('../../utils/error');
+               // Razorpay answered with a 4xx → our request was wrong (400).
+               // No answer at all (network down, Razorpay outage) → temporary (502), so callers retry.
+               const rejected = err?.statusCode >= 400 && err?.statusCode < 500;
+               throw rejected
+                    ? new AppError(`Payment gateway error: ${description}`, 400, 'PAYMENT_GATEWAY_ERROR')
+                    : new AppError('Payment gateway is unreachable right now. Please try again shortly.', 502, 'PAYMENT_GATEWAY_UNAVAILABLE');
           }
 
           logger.info(`Razorpay order created: ${order.id}`, { receipt, amount });
@@ -52,10 +57,15 @@ class RazorpayGateway extends BaseGateway {
                .update(body)
                .digest('hex');
 
-          return crypto.timingSafeEqual(
-               Buffer.from(expectedSignature, 'hex'),
-               Buffer.from(signature, 'hex')
-          );
+          // timingSafeEqual throws on a length mismatch (malformed signature) → treat as invalid
+          try {
+               return crypto.timingSafeEqual(
+                    Buffer.from(expectedSignature, 'hex'),
+                    Buffer.from(String(signature), 'hex')
+               );
+          } catch {
+               return false;
+          }
      }
 
      verifyWebhookSignature(rawBody, signature) {
@@ -89,10 +99,22 @@ class RazorpayGateway extends BaseGateway {
      async initiateRefund(paymentId, amount, notes = {}) {
           const amountInPaise = Math.round(amount * 100);
 
-          const refund = await this.client.payments.refund(paymentId, {
-               amount: amountInPaise,
-               notes,
-          });
+          let refund;
+          try {
+               refund = await this.client.payments.refund(paymentId, {
+                    amount: amountInPaise,
+                    notes,
+               });
+          } catch (err) {
+               // Razorpay SDK throws plain objects, not Error instances (same as createOrder)
+               const description = err?.error?.description || err?.message || JSON.stringify(err);
+               logger.error(`Razorpay refund failed: ${description}`, { paymentId, amount });
+               const { AppError } = require('../../utils/error');
+               const rejected = err?.statusCode >= 400 && err?.statusCode < 500;
+               throw rejected
+                    ? new AppError(`Payment gateway refused the refund: ${description}`, 400, 'PAYMENT_GATEWAY_ERROR')
+                    : new AppError('Payment gateway is unreachable right now. Please try again shortly.', 502, 'PAYMENT_GATEWAY_UNAVAILABLE');
+          }
 
           logger.info(`Razorpay refund initiated: ${refund.id}`, { paymentId, amount });
 

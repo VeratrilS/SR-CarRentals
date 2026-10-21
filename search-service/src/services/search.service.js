@@ -1,5 +1,6 @@
 const { esClient, CAR_INDEX, BRANCH_INDEX } = require('../config/elasticsearch');
 const logger = require('../config/logger');
+const { BoolQueryBuilder } = require('../utils/boolQueryBuilder');
 
 // Mirrors booking-service pricing so search can show an estimate.
 // The authoritative price is always the booking-service quote.
@@ -211,36 +212,33 @@ const searchCars = async ({ location, pickupAt, dropoffAt, category, transmissio
           return { cars: [], count: 0, message: `No branch found for "${location}"` };
      }
 
-     const filter = [{ term: { status: 'ACTIVE' } }];
-     if (resolved.type === 'branch') filter.push({ term: { 'branch.branchId': resolved.branchId } });
-     if (resolved.type === 'city') filter.push({ term: { 'branch.city': resolved.city } });
-     if (category) filter.push({ terms: { category: String(category).toUpperCase().split(',') } });
-     if (transmission) filter.push({ term: { transmission: String(transmission).toUpperCase() } });
-     if (fuelType) filter.push({ terms: { fuelType: String(fuelType).toUpperCase().split(',') } });
-     if (minSeats) filter.push({ range: { seats: { gte: Number(minSeats) } } });
-     if (maxPrice) filter.push({ range: { dailyRate: { lte: Number(maxPrice) } } });
+     const upperList = (v) => (v ? String(v).toUpperCase().split(',') : undefined);
+     const query = new BoolQueryBuilder()
+          .term('status', 'ACTIVE')
+          .term('branch.branchId', resolved.type === 'branch' ? resolved.branchId : undefined)
+          .term('branch.city', resolved.type === 'city' ? resolved.city : undefined)
+          .terms('category', upperList(category))
+          .term('transmission', transmission ? String(transmission).toUpperCase() : undefined)
+          .terms('fuelType', upperList(fuelType))
+          .range('seats', { gte: minSeats ? Number(minSeats) : undefined })
+          .range('dailyRate', { lte: maxPrice ? Number(maxPrice) : undefined });
 
-     const mustNot = [];
      let pickup = null;
      let dropoff = null;
      if (pickupAt && dropoffAt) {
           pickup = new Date(pickupAt);
           dropoff = new Date(dropoffAt);
           // Exclude cars with any booked/held interval intersecting the requested window
-          mustNot.push({
-               range: {
-                    blockedRanges: {
-                         gte: pickup.toISOString(),
-                         lt: dropoff.toISOString(),
-                         relation: 'intersects',
-                    },
-               },
+          query.excludeRange('blockedRanges', {
+               gte: pickup.toISOString(),
+               lt: dropoff.toISOString(),
+               relation: 'intersects',
           });
      }
 
      const result = await esClient.search({
           index: CAR_INDEX,
-          query: { bool: { filter, must_not: mustNot } },
+          query: query.build(),
           sort: SORTS[sort] || SORTS.price_asc,
           size: 100,
           aggs: {

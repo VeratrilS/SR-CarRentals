@@ -9,26 +9,16 @@ const { calculatePrice, validateRentalWindow, minDriverAge, calculateRefund, cal
 const holds = require('./holds');
 const saga = require('./saga.service');
 const bookingProducer = require('../kafka/producer/booking.producer');
-const { BadRequestError, NotFoundError, ConflictError, StaleStateError } = require('../utils/error');
-
-const ACTIVE_STATUSES = ['PENDING', 'CAR_HELD', 'PAYMENT_PENDING', 'CONFIRMED'];
+const { BadRequestError, NotFoundError, ConflictError } = require('../utils/error');
+const { TRANSITIONS, ACTIVE_STATUSES, UNPAID_STATUSES, canTransition, isTerminal, transition, transitionOrThrow } = require('./bookingState');
 
 // ─── Optimistic Lock Helper (CAS — Compare-And-Swap) ────────────────────────
-// Atomically updates booking status ONLY IF the version hasn't changed since read.
-// Returns the updated booking or throws StaleStateError if another process got there first.
+// Moves the booking to `to` ONLY IF neither its status nor its version changed
+// since we read it (and the state machine allows the move).
+// Throws StaleStateError if another process got there first.
 
-const casUpdateBooking = async (bookingId, expectedVersion, data) => {
-     const result = await prisma.booking.updateMany({
-          where: { id: bookingId, version: expectedVersion },
-          data: { ...data, version: { increment: 1 } },
-     });
-
-     if (result.count === 0) {
-          throw new StaleStateError(
-               `Booking ${bookingId} was modified by another process (expected version ${expectedVersion})`
-          );
-     }
-};
+const casUpdateBooking = (booking, to, data = {}) =>
+     transitionOrThrow(booking.id, to, { from: booking.status, version: booking.version, data });
 
 // ─── Notification Helpers ────────────────────────────────────────────────────
 // Looks up the user so booking events can carry email/firstName directly.
@@ -92,6 +82,15 @@ const saveIdempotency = async (key, response) => {
      await prisma.idempotencyRecord.create({
           data: { eventKey: key, response },
      });
+};
+
+// booking.idempotencyKey is unique: the key was already used by an earlier attempt
+// that failed (successful ones are answered from the cache above), or by someone else
+const rethrowDuplicateKey = (err) => {
+     if (err.code === 'P2002') {
+          throw new ConflictError('This booking request was already used. Please start a new booking.', 'DUPLICATE_REQUEST');
+     }
+     throw err;
 };
 
 // ─── Validation ──────────────────────────────────────────────────────────────
@@ -158,7 +157,7 @@ const createBooking = async (userId, carId, pickupAtRaw, dropoffAtRaw, driver, i
      if (windowError) throw new BadRequestError(windowError);
 
      // 2. Check idempotency
-     const cached = await checkIdempotency(`booking:${idempotencyKey}`);
+     const cached = await checkIdempotency(`booking:${userId}:${idempotencyKey}`);
      if (cached) return cached;
 
      // 3. Fetch the car and check the window is free (fast fail — inventory re-checks under lock)
@@ -215,7 +214,7 @@ const createBooking = async (userId, carId, pickupAtRaw, dropoffAtRaw, driver, i
                     idempotencyKey,
                     lockExpiresAt,
                },
-          });
+          }).catch(rethrowDuplicateKey);
 
           // 6. Saga Step 1: hold the car in inventory
           await saga.executeHold(booking, config.LOCK_TTL_SECONDS);
@@ -246,7 +245,7 @@ const createBooking = async (userId, carId, pickupAtRaw, dropoffAtRaw, driver, i
                },
           };
 
-          await saveIdempotency(`booking:${idempotencyKey}`, response);
+          await saveIdempotency(`booking:${userId}:${idempotencyKey}`, response);
 
           return response;
 
@@ -256,12 +255,10 @@ const createBooking = async (userId, carId, pickupAtRaw, dropoffAtRaw, driver, i
 
           if (booking) {
                await saga.compensateAll(booking);
-               await prisma.booking.update({
-                    where: { id: booking.id },
-                    data: {
-                         status: 'FAILED',
-                         failureReason: error.response?.data?.message || error.message,
-                    },
+               // Only if still unpaid — a booking cancelled meanwhile stays CANCELLED
+               await transition(booking.id, 'FAILED', {
+                    from: UNPAID_STATUSES,
+                    data: { failureReason: error.response?.data?.message || error.message },
                });
           }
 
@@ -289,7 +286,7 @@ const handlePaymentSuccess = async (paymentOrderId) => {
 
      // Payment landed after the booking expired / was cancelled — the customer was
      // charged for a car they no longer hold, so refund it in full.
-     if (['EXPIRED', 'CANCELLED', 'FAILED'].includes(booking.status)) {
+     if (isTerminal(booking.status)) {
           logger.warn(`Late payment for ${booking.status} booking ${booking.id} — refunding`);
           try {
                await paymentClient.initiateRefund(
@@ -312,15 +309,12 @@ const handlePaymentSuccess = async (paymentOrderId) => {
 
      try {
           // Atomically claim this booking — if expiry job or cancel already changed it, bail out
-          await casUpdateBooking(booking.id, booking.version, { status: 'CONFIRMING' });
+          await casUpdateBooking(booking, 'CONFIRMING');
 
           // Saga Step 3: confirm the hold in inventory
           await saga.executeConfirm(booking);
 
-          await prisma.booking.updateMany({
-               where: { id: booking.id, status: 'CONFIRMING' },
-               data: { status: 'CONFIRMED', lockExpiresAt: null, version: { increment: 1 } },
-          });
+          await transition(booking.id, 'CONFIRMED', { from: 'CONFIRMING', data: { lockExpiresAt: null } });
 
           await forceReleaseBookingLock(booking);
 
@@ -349,13 +343,9 @@ const handlePaymentSuccess = async (paymentOrderId) => {
           // Compensate: refund payment and release the car
           await saga.compensateAll(booking);
 
-          await prisma.booking.updateMany({
-               where: { id: booking.id, status: { in: ['PAYMENT_PENDING', 'CONFIRMING'] } },
-               data: {
-                    status: 'FAILED',
-                    failureReason: `confirm_failed: ${error.message}`,
-                    version: { increment: 1 },
-               },
+          await transition(booking.id, 'FAILED', {
+               from: ['PAYMENT_PENDING', 'CONFIRMING'],
+               data: { failureReason: `confirm_failed: ${error.message}` },
           });
 
           await forceReleaseBookingLock(booking);
@@ -383,7 +373,7 @@ const handlePaymentFailure = async (paymentOrderId, reason) => {
      }
 
      // Idempotent
-     if (['FAILED', 'CANCELLED', 'EXPIRED'].includes(booking.status)) {
+     if (isTerminal(booking.status)) {
           logger.info(`Booking ${booking.id} already in terminal state: ${booking.status}`);
           return;
      }
@@ -395,10 +385,7 @@ const handlePaymentFailure = async (paymentOrderId, reason) => {
 
      // Atomically claim this booking before compensating
      try {
-          await casUpdateBooking(booking.id, booking.version, {
-               status: 'FAILED',
-               failureReason: reason || 'payment_failed',
-          });
+          await casUpdateBooking(booking, 'FAILED', { failureReason: reason || 'payment_failed' });
      } catch (error) {
           if (error.code === 'STALE_STATE') {
                logger.info(`Booking ${booking.id} already handled by another process, skipping`);
@@ -432,7 +419,7 @@ const cancelBooking = async (bookingId, userId) => {
           throw new NotFoundError('Booking not found');
      }
 
-     if (['CANCELLED', 'CANCELLING', 'FAILED', 'EXPIRED', 'CONFIRMING'].includes(booking.status)) {
+     if (!canTransition(booking.status, 'CANCELLING')) {
           throw new ConflictError(`Booking is already ${booking.status}`);
      }
 
@@ -447,10 +434,7 @@ const cancelBooking = async (bookingId, userId) => {
 
      // Atomically claim this booking — prevents race with payment webhook or expiry job
      try {
-          await casUpdateBooking(booking.id, booking.version, {
-               status: 'CANCELLING',
-               failureReason: 'user_cancelled',
-          });
+          await casUpdateBooking(booking, 'CANCELLING', { failureReason: 'user_cancelled' });
      } catch (error) {
           if (error.code === 'STALE_STATE') {
                const fresh = await prisma.booking.findUnique({ where: { id: bookingId } });
@@ -472,10 +456,7 @@ const cancelBooking = async (bookingId, userId) => {
                     error: error.message,
                });
                // Roll back from CANCELLING to CONFIRMED so the user can retry
-               await prisma.booking.updateMany({
-                    where: { id: booking.id, status: 'CANCELLING' },
-                    data: { status: 'CONFIRMED', failureReason: null, version: { increment: 1 } },
-               });
+               await transition(booking.id, 'CONFIRMED', { from: 'CANCELLING', data: { failureReason: null } });
                throw error;
           }
 
@@ -504,10 +485,7 @@ const cancelBooking = async (bookingId, userId) => {
 
      const refundAmount = refundInitiated ? refund.refundAmount : 0;
 
-     await prisma.booking.updateMany({
-          where: { id: booking.id, status: 'CANCELLING' },
-          data: { status: 'CANCELLED', refundAmount, version: { increment: 1 } },
-     });
+     await transition(booking.id, 'CANCELLED', { from: 'CANCELLING', data: { refundAmount } });
 
      await forceReleaseBookingLock(booking);
 
@@ -609,9 +587,16 @@ const getBooking = async (bookingId, userId) => {
 };
 
 const getUserBookings = async (userId, { status, when, page = 1, limit = 10 } = {}) => {
+     // Clamp: NaN / negative values reach Prisma as an invalid skip/take (500)
+     page = Number.isInteger(page) && page > 0 ? page : 1;
+     limit = Number.isInteger(limit) ? Math.min(50, Math.max(1, limit)) : 10;
      const skip = (page - 1) * limit;
      const where = { userId };
-     if (status) where.status = status.toUpperCase();
+     if (status) {
+          const wanted = String(status).toUpperCase();
+          if (!(wanted in TRANSITIONS)) throw new BadRequestError(`status must be one of ${Object.keys(TRANSITIONS).join(', ')}`);
+          where.status = wanted;
+     }
 
      // upcoming = still relevant (active and not yet returned); past = everything else
      const now = new Date();
@@ -699,11 +684,12 @@ const cancelAffectedBookings = async (where, reason, label) => {
      for (const booking of affected) {
           try {
                const refundDue = booking.status === 'CONFIRMED' ? booking.totalAmount : 0;
-               const claimed = await prisma.booking.updateMany({
-                    where: { id: booking.id, version: booking.version, status: { in: ACTIVE_STATUSES } },
-                    data: { status: 'CANCELLED', failureReason: reason, version: { increment: 1 } },
+               const claimed = await transition(booking.id, 'CANCELLED', {
+                    from: ACTIVE_STATUSES,
+                    version: booking.version,
+                    data: { failureReason: reason },
                });
-               if (claimed.count === 0) {
+               if (!claimed) {
                     logger.info(`Booking ${booking.id} already handled, skipping`);
                     continue;
                }
@@ -809,7 +795,7 @@ const createSeatBooking = async (userId, { tripId, fromSeq, toSeq, seatNumbers, 
      if (seats.length > MAX_SEATS_PER_BOOKING) throw new BadRequestError(`You can book up to ${MAX_SEATS_PER_BOOKING} seats at a time`);
      validatePassengers(passengers, seats);
 
-     const cached = await checkIdempotency(`booking:${idempotencyKey}`);
+     const cached = await checkIdempotency(`booking:${userId}:${idempotencyKey}`);
      if (cached) return cached;
 
      const { seatMap, fromStop, toStop } = await loadTripStretch(tripId, fromSeq, toSeq);
@@ -867,7 +853,7 @@ const createSeatBooking = async (userId, { tripId, fromSeq, toSeq, seatNumbers, 
                     idempotencyKey,
                     lockExpiresAt: new Date(Date.now() + config.BOOKING_TTL_SECONDS * 1000),
                },
-          });
+          }).catch(rethrowDuplicateKey);
 
           await saga.executeHold(booking, config.LOCK_TTL_SECONDS);
           const paymentOrder = await saga.executeCreatePayment(booking);
@@ -895,15 +881,15 @@ const createSeatBooking = async (userId, { tripId, fromSeq, toSeq, seatNumbers, 
                     keyId: paymentOrder.keyId,
                },
           };
-          await saveIdempotency(`booking:${idempotencyKey}`, response);
+          await saveIdempotency(`booking:${userId}:${idempotencyKey}`, response);
           return response;
      } catch (error) {
           logger.error(`Seat booking failed for user ${userId}`, { error: error.message });
           if (booking) {
                await saga.compensateAll(booking);
-               await prisma.booking.update({
-                    where: { id: booking.id },
-                    data: { status: 'FAILED', failureReason: error.response?.data?.message || error.message },
+               await transition(booking.id, 'FAILED', {
+                    from: UNPAID_STATUSES,
+                    data: { failureReason: error.response?.data?.message || error.message },
                });
           }
           await releaseKeys(lockKeys, lockValue);

@@ -27,12 +27,17 @@ function layout(title, body, footer = `Drive safe! 🚗<br/><strong>Team ${BRAND
   `;
 }
 
+// Names and other values typed by users must not become live HTML in an email
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[c]));
+
 const greeting = (firstName) =>
-  `<p style="font-size: 16px; color: #333;">Hi ${firstName ? `<strong>${firstName}</strong>` : 'there'},</p>`;
+  `<p style="font-size: 16px; color: #333;">Hi ${firstName ? `<strong>${esc(firstName)}</strong>` : 'there'},</p>`;
 
 const infoBox = (rows) => `
   <div style="background: ${BRAND_TINT}; padding: 15px; border-radius: 8px; margin: 20px 0;">
-    ${rows.filter(Boolean).map(([k, v]) => `<p style="margin: 6px 0; font-size: 15px;"><strong>${k}:</strong> ${v}</p>`).join('')}
+    ${rows.filter(Boolean).map(([k, v]) => `<p style="margin: 6px 0; font-size: 15px;"><strong>${k}:</strong> ${esc(v)}</p>`).join('')}
   </div>`;
 
 function formatDateTime(value) {
@@ -132,7 +137,7 @@ function getSeatBookingConfirmedTemplate(data) {
       ])}
       ${passengers.length ? `
       <p style="font-size: 15px; font-weight: bold; margin: 16px 0 6px;">Passengers</p>
-      ${passengers.map((p, i) => `<p style="margin: 4px 0; font-size: 14px;">${i + 1}. ${p.name} (${p.age}, ${p.gender}) — seat ${p.seatNumber}</p>`).join('')}` : ''}
+      ${passengers.map((p, i) => `<p style="margin: 4px 0; font-size: 14px;">${i + 1}. ${esc(p.name)} (${esc(p.age)}, ${esc(p.gender)}) — seat ${esc(p.seatNumber)}</p>`).join('')}` : ''}
       <table style="width: 100%; font-size: 15px; border-collapse: collapse; margin-top: 12px;">
         <tr><td style="padding: 6px 0;">${seatNumbers.length} seat(s) × ${inr(seatFare)}</td><td style="text-align: right;">${inr(totalAmount)}</td></tr>
         <tr><td style="padding: 8px 0; border-top: 1px solid #eee;"><strong>Total paid</strong></td><td style="text-align: right; border-top: 1px solid #eee;"><strong>${inr(totalAmount)}</strong></td></tr>

@@ -29,8 +29,9 @@ exports.createBranch = asyncHandler(async (req, res) => {
 
 
 exports.getAllBranches = asyncHandler(async (req, res) => {
-     const page = parseInt(req.query.page) || 1;
-     const limit = parseInt(req.query.limit) || 50;
+     // Clamp: a negative page gives Prisma a negative skip (500), a huge limit dumps the table
+     const page = Math.max(1, parseInt(req.query.page) || 1);
+     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
      const search = req.query.search;
 
      const result = await branchService.getAllBranches(page, limit, search);

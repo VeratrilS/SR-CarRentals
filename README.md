@@ -36,6 +36,8 @@ React 18 + Vite + Tailwind + Zustand. Light/dark/system theme (no flash on load)
 
 ## Architecture
 
+> Design patterns (all 23 GoF, where and why each is or isn't used), class diagrams and the distributed-systems patterns are explained in **[docs/DESIGN_PATTERNS.md](docs/DESIGN_PATTERNS.md)**.
+
 ```mermaid
 flowchart LR
     FE[React frontend<br/>Vite + Tailwind] --> GW[API Gateway :4000<br/>JWT · RBAC · rate limit · circuit breakers]
@@ -162,7 +164,8 @@ npm ci
 ```
 
 - `JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET` must be identical in `user-service` and `api-gateway`.
-- `INTERNAL_SERVICE_KEY` must be identical in every service that has it.
+- `OTP_HMAC_SECRET` is required in `user-service/.env` (there is no built-in default).
+- `INTERNAL_SERVICE_KEY` must be identical in `api-gateway` **and** every service that has it. The gateway sends it with each request so services can trust the `x-user-id` header; a request that bypasses the gateway is rejected.
 - Use the Postgres and Redis passwords from the root `.env` in each service's `DATABASE_URL` / `REDIS_URL`.
 - Add your email to `ADMIN_EMAILS` in `user-service/.env` to get fleet-admin access.
 - **Email sender:** `MAIL_SEND` must be a SendGrid-verified sender on a domain whose DMARC policy doesn't reject third-party senders (a Gmail address works; many college/company domains use `p=reject`, which silently drops every email). Check with `nslookup -type=txt _dmarc.<domain>`.
@@ -180,8 +183,10 @@ The overlap-preventing exclusion constraint is applied automatically by inventor
 
 ### 4. Run
 
+Make sure the containers from step 1 are up (`docker compose ps`), then start the services.
+**Option A: one terminal per service** (best while studying, because you see each log):
+
 ```bash
-# each in its own terminal (or use your process manager of choice)
 cd user-service && npm run dev
 cd admin-service && npm run dev
 cd inventory-service && npm run dev
@@ -193,7 +198,42 @@ cd api-gateway && npm run dev
 cd frontend && npm run dev        # http://localhost:3000
 ```
 
-### 5. Demo data
+**Option B: all backend services from one terminal** (Git Bash / macOS / Linux; logs go to `logs/`):
+
+```bash
+mkdir -p logs
+for s in user-service admin-service inventory-service payment-service booking-service search-service notification-service api-gateway; do
+  (cd $s && nohup node src/index.js > ../logs/$s.log 2>&1 &)
+done
+cd frontend && npm run dev
+```
+
+> Start each service **once**. A second copy of a service still joins its Kafka consumer group even if
+> its HTTP port is taken, and silently takes half of the events (see Troubleshooting).
+
+### 5. Check that everything is up
+
+```bash
+for p in 4000 4001 4002 4003 4005 4006 4007; do
+  printf "%s → %s\n" $p "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:$p/health)"
+done
+# every line should end in 200 (notification-service, 4004, has no HTTP server: check its log
+# for "Email consumer running")
+
+curl "http://localhost:4000/api/search/cars?location=Hyderabad"   # after seeding: "count" > 0
+```
+
+On startup search-service rebuilds its Elasticsearch index by replaying Kafka, so car search can be
+empty for the first ~10–30 seconds.
+
+### 6. Stop
+
+```bash
+# Ctrl+C in each terminal (Option A), or stop the node processes (Option B), then:
+docker compose stop          # keeps your data; `docker compose down -v` deletes it
+```
+
+### 7. Demo data
 
 Register through the UI with an email listed in `ADMIN_EMAILS`, then:
 
@@ -202,6 +242,42 @@ ADMIN_EMAIL=you@example.com ADMIN_PASSWORD=yourpassword node scripts/seed-demo.j
 ```
 
 This creates branches in Hyderabad, Bengaluru, Mumbai, Suryapet and Vijayawada, a mixed fleet, a Hyderabad → Suryapet → Vijayawada route and daily shared-ride trips for the next 5 days. It is safe to re-run.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `docker compose up` says *port is already allocated* (e.g. 8081) | Another container uses that port | Only the admin UIs (pgAdmin 8081, Kafka UI 8080, Kibana 5601) are optional. Start just the core: `docker compose up -d postgres redis zookeeper kafka elasticsearch` |
+| Car search returns 0 cars right after a restart | search-service is still replaying Kafka into a fresh index | Wait ~30 s; check its log for `Replaying Kafka history` |
+| Car search stays empty, logs say *group is rebalancing* forever | Two copies of a service are running and sharing the consumer group | Stop **all** node processes, then start each service once |
+| `429 Too many requests` when creating bookings | Anti-abuse limit: 5 booking attempts per minute per IP | Wait a minute (this is intended) |
+| No OTP email arrives | Sender not verified, or the sender's domain rejects third-party mail (DMARC) | See the *Email sender* note in step 2; set `LOG_OTP_IN_DEV=true` to read the OTP from the user-service log |
+| A service exits with *Missing required environment variable* | `.env` incomplete | Copy the missing key from that service's `.env.example` |
+| `401 User context missing - must come through gateway` | You called a service port directly, or `INTERNAL_SERVICE_KEY` differs between gateway and service | Call through `http://localhost:4000/api/...`; make the keys identical |
+| Payment stays *pending* after paying in test mode | Razorpay can't reach `localhost` with webhooks | Payment is confirmed from the browser via `verify-payment`; for webhooks use a tunnel (e.g. `ngrok http 4000`) and set it in the Razorpay dashboard |
+
+---
+
+## Start here: how to study this project
+
+Study it **in the order a request flows**, one module at a time. The full plan, with the files to
+read in order, the concepts, the questions to answer and the exercises, is in
+**[docs/STUDY_GUIDE.md](docs/STUDY_GUIDE.md)**. The design patterns and class diagrams are in
+**[docs/DESIGN_PATTERNS.md](docs/DESIGN_PATTERNS.md)**.
+
+| Order | Module | You learn |
+|------:|--------|-----------|
+| 0 | Run it, book a car and a seat | How the pieces fit together |
+| 1 | `api-gateway/` | Proxy, auth, rate limiting, circuit breaker |
+| 2 | `user-service/` | JWT + refresh tokens, OTP, Redis |
+| 3 | `admin-service/` | Publishing events to Kafka |
+| 4 | `inventory-service/` | Locks, overlap checks, DB constraints |
+| 5 | `search-service/` | Elasticsearch, CQRS, event replay |
+| 6 | `booking-service/` ⭐ | Saga, State machine, idempotency |
+| 7 | `payment-service/` | Razorpay, webhooks, refunds |
+| 8 | `notification-service/` | Consumers, dead-letter queue |
+| 9 | `shared/` | Code every service reuses |
+| 10 | `frontend/` | React client, polling, error handling |
 
 ---
 
@@ -240,8 +316,9 @@ This creates branches in Hyderabad, Bengaluru, Mumbai, Suryapet and Vijayawada, 
 ├── payment-service/      # Razorpay gateway abstraction, webhooks, refunds (Prisma)
 ├── search-service/       # Elasticsearch indices, availability search, autocomplete
 ├── notification-service/ # SendGrid email templates
-├── shared/               # Kafka topic registry, DLQ wrapper, topic bootstrap
+├── shared/               # Kafka topics, DLQ wrapper, topic bootstrap, EventConsumer base class
 ├── frontend/             # React + Vite + Tailwind + Zustand (car photos + credits in public/cars/)
+├── docs/                 # STUDY_GUIDE.md (what to study first) · DESIGN_PATTERNS.md (patterns + class diagrams)
 ├── scripts/seed-demo.js  # Demo branches & cars
 └── docker-compose.yml    # Postgres, Redis, Kafka/Zookeeper, Elasticsearch (+ admin UIs)
 ```

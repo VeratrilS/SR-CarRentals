@@ -2,6 +2,7 @@ const prisma = require('../config/prisma');
 const logger = require('../config/logger');
 const { paymentClient } = require('./paymentClient');
 const holds = require('./holds');
+const { transitionOrThrow } = require('./bookingState');
 
 /**
  * Saga orchestrator for the booking lifecycle (rentals and seat bookings alike).
@@ -9,15 +10,63 @@ const holds = require('./holds');
  *
  * Forward flow:  HOLD (car | seats) -> CREATE_PAYMENT -> CONFIRM (car | seats)
  * Compensation:  reverse order of completed steps
+ *
+ * Command pattern: every step is an object with
+ *   name(booking)        → the SagaLog step name
+ *   request(booking,…)   → what gets logged as the step's input
+ *   execute(booking,…)   → do the work in another service
+ *   compensate(booking)  → undo it
+ * so the orchestrator can run and undo any step without knowing what it does.
  */
 
-async function runStep(booking, step, request, action) {
+const HoldCommand = {
+     name: (booking) => holds.holdStep(booking),
+     request: (booking, ttlSeconds) => holds.strategyFor(booking).holdRequest(booking, ttlSeconds),
+     execute: (booking, ttlSeconds) => holds.placeHold(booking, ttlSeconds),
+     compensate: (booking) => holds.releaseHold(booking),
+};
+
+const CreatePaymentCommand = {
+     name: () => 'CREATE_PAYMENT',
+     request: (booking) => ({ bookingId: booking.id, amount: booking.totalAmount, userId: booking.userId }),
+     execute: (booking) => paymentClient.createPaymentOrder(booking.id, booking.totalAmount, booking.userId, `${booking.id}-payment`),
+     compensate: async (booking) => {
+          if (!booking.paymentOrderId) return;
+          await paymentClient.initiateRefund(
+               booking.paymentOrderId,
+               booking.totalAmount,
+               'booking_compensation',
+               `${booking.id}-refund-compensation`
+          );
+     },
+};
+
+const ConfirmCommand = {
+     name: (booking) => holds.confirmStep(booking),
+     request: (booking) => ({ bookingId: booking.id, userId: booking.userId }),
+     execute: (booking) => holds.confirmHold(booking),
+     compensate: (booking) => holds.cancelReservation(booking),
+};
+
+/** SagaLog step name → the command that can undo it */
+const COMMANDS_BY_STEP = {
+     HOLD_CAR: HoldCommand,
+     HOLD_SEATS: HoldCommand,
+     CREATE_PAYMENT: CreatePaymentCommand,
+     CONFIRM_CAR: ConfirmCommand,
+     CONFIRM_SEATS: ConfirmCommand,
+};
+
+// ─── Invoker ─────────────────────────────────────────────────────────────────
+
+async function runStep(command, booking, ...args) {
+     const step = command.name(booking);
      const sagaLog = await prisma.sagaLog.create({
-          data: { bookingId: booking.id, step, status: 'PENDING', request },
+          data: { bookingId: booking.id, step, status: 'PENDING', request: command.request(booking, ...args) },
      });
 
      try {
-          const result = await action();
+          const result = await command.execute(booking, ...args);
           await prisma.sagaLog.update({
                where: { id: sagaLog.id },
                data: { status: 'COMPLETED', response: result ?? {} },
@@ -34,92 +83,50 @@ async function runStep(booking, step, request, action) {
      }
 }
 
+async function undoStep(command, booking) {
+     const step = command.name(booking);
+     logger.info(`Compensating ${step} for booking ${booking.id}`);
+     try {
+          await command.compensate(booking);
+          await prisma.sagaLog.updateMany({
+               where: { bookingId: booking.id, step, status: 'COMPLETED' },
+               data: { status: 'COMPENSATED' },
+          });
+     } catch (error) {
+          // Inventory lock expiry / payment reconciliation will eventually clean this up
+          logger.error(`Failed to compensate ${step} for booking ${booking.id}`, { error: error.message });
+     }
+}
+
 // ─── Forward Steps ───────────────────────────────────────────────────────────
+// Each forward step also moves the booking one state ahead. If the booking was
+// cancelled/expired while the step ran, the transition loses the race and throws,
+// so the caller compensates instead of resurrecting a cancelled booking.
 
 async function executeHold(booking, ttlSeconds) {
-     const result = await runStep(
-          booking,
-          holds.holdStep(booking),
-          holds.isSeat(booking)
-               ? { tripId: booking.tripId, seatNumbers: booking.seatNumbers, fromSeq: booking.fromSeq, toSeq: booking.toSeq, ttlSeconds }
-               : { carId: booking.carId, pickupAt: booking.pickupAt, dropoffAt: booking.dropoffAt, ttlSeconds },
-          () => holds.placeHold(booking, ttlSeconds)
-     );
-
-     await prisma.booking.update({ where: { id: booking.id }, data: { status: 'CAR_HELD' } });
+     const result = await runStep(HoldCommand, booking, ttlSeconds);
+     await transitionOrThrow(booking.id, 'CAR_HELD', { from: 'PENDING' });
      return result;
 }
 
 async function executeCreatePayment(booking) {
-     const result = await runStep(
-          booking,
-          'CREATE_PAYMENT',
-          { bookingId: booking.id, amount: booking.totalAmount, userId: booking.userId },
-          () => paymentClient.createPaymentOrder(booking.id, booking.totalAmount, booking.userId, `${booking.id}-payment`)
-     );
-
-     await prisma.booking.update({
-          where: { id: booking.id },
-          data: { status: 'PAYMENT_PENDING', paymentOrderId: result.paymentOrderId },
+     const result = await runStep(CreatePaymentCommand, booking);
+     await transitionOrThrow(booking.id, 'PAYMENT_PENDING', {
+          from: 'CAR_HELD',
+          data: { paymentOrderId: result.paymentOrderId },
      });
      return result;
 }
 
 async function executeConfirm(booking) {
-     return runStep(
-          booking,
-          holds.confirmStep(booking),
-          { bookingId: booking.id, userId: booking.userId },
-          () => holds.confirmHold(booking)
-     );
+     return runStep(ConfirmCommand, booking);
 }
 
 // ─── Compensation Steps ──────────────────────────────────────────────────────
 
-async function markCompensated(booking, step) {
-     await prisma.sagaLog.updateMany({
-          where: { bookingId: booking.id, step, status: 'COMPLETED' },
-          data: { status: 'COMPENSATED' },
-     });
-}
-
-async function compensateHold(booking) {
-     logger.info(`Compensating hold for booking ${booking.id}`);
-     try {
-          await holds.releaseHold(booking);
-          await markCompensated(booking, holds.holdStep(booking));
-     } catch (error) {
-          // Inventory lock expiry will eventually clean this up
-          logger.error(`Failed to compensate hold for booking ${booking.id}`, { error: error.message });
-     }
-}
-
-async function compensateCreatePayment(booking) {
-     if (!booking.paymentOrderId) return;
-
-     logger.info(`Compensating CREATE_PAYMENT for booking ${booking.id}`);
-     try {
-          await paymentClient.initiateRefund(
-               booking.paymentOrderId,
-               booking.totalAmount,
-               'booking_compensation',
-               `${booking.id}-refund-compensation`
-          );
-          await markCompensated(booking, 'CREATE_PAYMENT');
-     } catch (error) {
-          logger.error(`Failed to compensate CREATE_PAYMENT for booking ${booking.id}`, { error: error.message });
-     }
-}
-
-async function compensateConfirm(booking) {
-     logger.info(`Compensating confirmation for booking ${booking.id}`);
-     try {
-          await holds.cancelReservation(booking);
-          await markCompensated(booking, holds.confirmStep(booking));
-     } catch (error) {
-          logger.error(`Failed to compensate confirmation for booking ${booking.id}`, { error: error.message });
-     }
-}
+const compensateHold = (booking) => undoStep(HoldCommand, booking);
+const compensateCreatePayment = (booking) => undoStep(CreatePaymentCommand, booking);
+const compensateConfirm = (booking) => undoStep(ConfirmCommand, booking);
 
 /**
  * Compensate all completed saga steps in reverse order.
@@ -131,20 +138,9 @@ async function compensateAll(booking) {
           orderBy: { createdAt: 'desc' },
      });
 
-     for (const step of completedSteps) {
-          switch (step.step) {
-               case 'CONFIRM_CAR':
-               case 'CONFIRM_SEATS':
-                    await compensateConfirm(booking);
-                    break;
-               case 'CREATE_PAYMENT':
-                    await compensateCreatePayment(booking);
-                    break;
-               case 'HOLD_CAR':
-               case 'HOLD_SEATS':
-                    await compensateHold(booking);
-                    break;
-          }
+     for (const { step } of completedSteps) {
+          const command = COMMANDS_BY_STEP[step];
+          if (command) await undoStep(command, booking);
      }
 }
 

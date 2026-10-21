@@ -2,67 +2,18 @@ const { kafka, consumer, producer, connectProducer } = require('../../config/kaf
 const emailService = require('../../services/email.service');
 const logger = require('../../config/logger');
 const { KAFKA_TOPICS } = require('../../../../shared/constants/kafka-topics');
-const { withDLQ } = require('../../../../shared/utils/dlqHandler');
-const { ensureTopics } = require('../../../../shared/utils/ensureTopics');
+const { EventConsumer } = require('../../../../shared/utils/eventConsumer');
 
-class EmailConsumer {
-     async start() {
-          try {
-               await ensureTopics(kafka, logger);
-               await consumer.connect();
-               await connectProducer(); // needed for DLQ publishing
-               logger.info('Email consumer connected to Kafka');
-
-               await consumer.subscribe({
-                    topics: [
-                         KAFKA_TOPICS.OTP_EMAIL,
-                         KAFKA_TOPICS.WELCOME_EMAIL,
-                         KAFKA_TOPICS.BOOKING_CONFIRMED,
-                         KAFKA_TOPICS.BOOKING_FAILED,
-                         KAFKA_TOPICS.BOOKING_CANCELLED,
-                    ],
-                    fromBeginning: false
-               });
-
-               await consumer.run({
-                    eachMessage: withDLQ(producer, KAFKA_TOPICS.DLQ_NOTIFICATION, logger, async ({ topic, parsedValue }) => {
-                         logger.info(`Processing message from topic: ${topic}`);
-                         await this.handleMessage(topic, parsedValue);
-                    }),
-               });
-
-               logger.info('Email consumer is running and listening for messages...');
-          } catch (error) {
-               logger.error('Failed to start email consumer', { error: error.message });
-               throw error;
-          }
-     }
-
-     async handleMessage(topic, data) {
-          switch (topic) {
-               case KAFKA_TOPICS.OTP_EMAIL:
-                    await this.handleOtpEmail(data);
-                    break;
-
-               case KAFKA_TOPICS.WELCOME_EMAIL:
-                    await this.handleWelcomeEmail(data);
-                    break;
-
-               case KAFKA_TOPICS.BOOKING_CONFIRMED:
-                    await this.handleBookingConfirmed(data);
-                    break;
-
-               case KAFKA_TOPICS.BOOKING_FAILED:
-                    await this.handleBookingFailed(data);
-                    break;
-
-               case KAFKA_TOPICS.BOOKING_CANCELLED:
-                    await this.handleBookingCancelled(data);
-                    break;
-
-               default:
-                    logger.warn(`Unknown topic: ${topic}`);
-          }
+class EmailConsumer extends EventConsumer {
+     // Observer: one handler per event this service reacts to
+     handlers() {
+          return {
+               [KAFKA_TOPICS.OTP_EMAIL]: (event) => this.handleOtpEmail(event),
+               [KAFKA_TOPICS.WELCOME_EMAIL]: (event) => this.handleWelcomeEmail(event),
+               [KAFKA_TOPICS.BOOKING_CONFIRMED]: (event) => this.handleBookingConfirmed(event),
+               [KAFKA_TOPICS.BOOKING_FAILED]: (event) => this.handleBookingFailed(event),
+               [KAFKA_TOPICS.BOOKING_CANCELLED]: (event) => this.handleBookingCancelled(event),
+          };
      }
 
      async handleOtpEmail(data) {
@@ -122,11 +73,11 @@ class EmailConsumer {
           await emailService.sendBookingCancelledEmail(email, data);
           logger.info(`Booking cancelled email sent to ${email}`, { bookingId });
      }
-
-     async stop() {
-          await consumer.disconnect();
-          logger.info('Email consumer disconnected');
-     }
 }
 
-module.exports = new EmailConsumer();
+module.exports = new EmailConsumer({
+     name: 'Email',
+     kafka, consumer, producer, connectProducer, logger,
+     dlqTopic: KAFKA_TOPICS.DLQ_NOTIFICATION,
+     fromBeginning: false,
+});

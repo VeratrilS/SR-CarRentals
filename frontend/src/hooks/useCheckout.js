@@ -50,7 +50,8 @@ export function useCheckout() {
         finish();
       },
       onFailure: (response) => {
-        showToast('Payment failed: ' + (response?.error?.description || 'Unknown error'), 'error');
+        // A failed attempt doesn't cancel the booking: the car stays held until the timer runs out
+        showToast(`Payment failed: ${response?.error?.description || 'Unknown error'}. Your car is still held, so you can try again from the booking page.`, 'error');
         finish();
       },
     });

@@ -143,6 +143,23 @@ const handleWebhook = async (rawBody, signature) => {
      return { status: 'ignored', event };
 };
 
+/**
+ * Money arrived. Statuses an order may be captured from: CREATED, and FAILED too —
+ * FAILED can only mean an earlier *attempt* failed; if money now arrived anyway we must
+ * record it and tell booking-service (which confirms the booking, or refunds it if the
+ * booking can no longer be confirmed). Ignoring it would keep the customer's money.
+ */
+const CAPTURABLE = ['CREATED', 'FAILED'];
+
+/** Atomically move CREATED/FAILED → CAPTURED. Only one of webhook / client-verify wins. */
+const claimCapture = async (paymentOrderId, data) => {
+     const result = await prisma.paymentOrder.updateMany({
+          where: { id: paymentOrderId, status: { in: CAPTURABLE } },
+          data: { ...data, status: 'CAPTURED', version: { increment: 1 } },
+     });
+     return result.count === 1;
+};
+
 const handlePaymentCaptured = async (paymentOrder, gatewayPaymentId, paymentEntity) => {
      // Idempotent: already captured
      if (paymentOrder.status === 'CAPTURED') {
@@ -150,23 +167,21 @@ const handlePaymentCaptured = async (paymentOrder, gatewayPaymentId, paymentEnti
           return { status: 'already_processed' };
      }
 
-     if (paymentOrder.status !== 'CREATED') {
+     if (!CAPTURABLE.includes(paymentOrder.status)) {
           logger.warn(`Cannot capture payment in status: ${paymentOrder.status}`, {
                paymentOrderId: paymentOrder.id,
           });
           return { status: 'invalid_state', currentStatus: paymentOrder.status };
      }
 
-     // Update payment order
-     await prisma.paymentOrder.update({
-          where: { id: paymentOrder.id },
-          data: {
-               status: 'CAPTURED',
-               gatewayPaymentId,
-               gatewaySignature: paymentEntity.acquirer_data?.auth_code || null,
-               version: { increment: 1 },
-          },
+     const won = await claimCapture(paymentOrder.id, {
+          gatewayPaymentId,
+          gatewaySignature: paymentEntity.acquirer_data?.auth_code || null,
      });
+     if (!won) {
+          logger.info(`Payment ${paymentOrder.id} captured concurrently by another request`);
+          return { status: 'already_processed' };
+     }
 
      logger.info(`Payment captured: ${paymentOrder.id}`, { gatewayPaymentId });
 
@@ -183,40 +198,28 @@ const handlePaymentCaptured = async (paymentOrder, gatewayPaymentId, paymentEnti
      return { status: 'captured', paymentOrderId: paymentOrder.id };
 };
 
+/**
+ * `payment.failed` is about ONE payment attempt, not the order: Razorpay lets the
+ * customer retry (another card, UPI…) inside the same order. If we failed the order
+ * and the booking here, a successful retry would charge a customer whose booking was
+ * already gone. So: remember why the attempt failed, keep the order open, and let the
+ * booking's payment window decide — the booking expires (and releases the car) if no
+ * successful payment arrives in time.
+ */
 const handlePaymentFailed = async (paymentOrder, gatewayPaymentId, paymentEntity) => {
-     // Idempotent: already failed
-     if (paymentOrder.status === 'FAILED') {
-          return { status: 'already_processed' };
-     }
-
      if (paymentOrder.status !== 'CREATED') {
-          return { status: 'invalid_state', currentStatus: paymentOrder.status };
+          return { status: 'ignored', currentStatus: paymentOrder.status };
      }
 
      const reason = paymentEntity.error_description || paymentEntity.error_reason || 'payment_failed';
 
-     await prisma.paymentOrder.update({
-          where: { id: paymentOrder.id },
-          data: {
-               status: 'FAILED',
-               gatewayPaymentId,
-               failureReason: reason,
-               version: { increment: 1 },
-          },
+     await prisma.paymentOrder.updateMany({
+          where: { id: paymentOrder.id, status: 'CREATED' },
+          data: { failureReason: reason, version: { increment: 1 } },
      });
 
-     logger.info(`Payment failed: ${paymentOrder.id}`, { reason });
-
-     // Publish PAYMENT_FAILED to Kafka
-     await paymentProducer.publishPaymentFailed(
-          paymentOrder.id,
-          paymentOrder.bookingId,
-          reason
-     ).catch(err => {
-          logger.error('Failed to publish PAYMENT_FAILED', { error: err.message });
-     });
-
-     return { status: 'failed', paymentOrderId: paymentOrder.id };
+     logger.info(`Payment attempt failed for order ${paymentOrder.id} (order stays open for retry)`, { reason, gatewayPaymentId });
+     return { status: 'attempt_failed', paymentOrderId: paymentOrder.id };
 };
 
 const handleRefundProcessed = async (paymentOrder, refundEntity) => {
@@ -281,7 +284,7 @@ const verifyAndCapturePayment = async (paymentOrderId, gatewayPaymentId, gateway
           };
      }
 
-     if (paymentOrder.status !== 'CREATED') {
+     if (!CAPTURABLE.includes(paymentOrder.status)) {
           throw new ConflictError(`Payment order is in ${paymentOrder.status} status`);
      }
 
@@ -304,37 +307,21 @@ const verifyAndCapturePayment = async (paymentOrderId, gatewayPaymentId, gateway
      });
 
      if (!isValid) {
-          await prisma.paymentOrder.update({
-               where: { id: paymentOrder.id },
-               data: {
-                    status: 'FAILED',
-                    failureReason: 'signature_verification_failed',
-                    version: { increment: 1 },
-               },
-          });
-
-          // Publish failure
-          await paymentProducer.publishPaymentFailed(
-               paymentOrder.id,
-               paymentOrder.bookingId,
-               'signature_verification_failed'
-          ).catch(err => {
-               logger.error('Failed to publish PAYMENT_FAILED after sig failure', { error: err.message });
-          });
-
+          // A bad signature only proves THIS request is untrustworthy — not that the
+          // payment failed. Don't touch the order; the signed webhook stays the authority.
           throw new BadRequestError('Payment signature verification failed', 'INVALID_SIGNATURE');
      }
 
-     // Signature valid — capture payment
-     await prisma.paymentOrder.update({
-          where: { id: paymentOrder.id },
-          data: {
+     // Signature valid — capture payment (unless the webhook already did)
+     const won = await claimCapture(paymentOrder.id, { gatewayPaymentId, gatewaySignature });
+     if (!won) {
+          return {
+               paymentOrderId: paymentOrder.id,
                status: 'CAPTURED',
                gatewayPaymentId,
-               gatewaySignature,
-               version: { increment: 1 },
-          },
-     });
+               message: 'Payment already captured',
+          };
+     }
 
      await prisma.paymentAuditLog.create({
           data: {
@@ -399,13 +386,35 @@ const initiateRefund = async (paymentOrderId, amount, reason, idempotencyKey) =>
                );
           }
 
+          // Claim the order before calling the gateway (CAS on status + version): two
+          // concurrent refunds both read "refunded so far = 0" above, but only one wins here,
+          // so the order can never be refunded more than was paid.
+          const previousStatus = paymentOrder.status;
+          const claimed = await prisma.paymentOrder.updateMany({
+               where: { id: paymentOrder.id, status: previousStatus, version: paymentOrder.version },
+               data: { status: 'REFUND_INITIATED', version: { increment: 1 } },
+          });
+          if (claimed.count === 0) {
+               throw new ConflictError('Another refund for this payment is in progress. Please retry.', 'REFUND_IN_PROGRESS');
+          }
+
           const gateway = getGateway();
 
-          const gatewayResult = await gateway.initiateRefund(
-               paymentOrder.gatewayPaymentId,
-               amount,
-               { reason, bookingId: paymentOrder.bookingId }
-          );
+          let gatewayResult;
+          try {
+               gatewayResult = await gateway.initiateRefund(
+                    paymentOrder.gatewayPaymentId,
+                    amount,
+                    { reason, bookingId: paymentOrder.bookingId }
+               );
+          } catch (err) {
+               // Gateway refused / unreachable: release the claim so the refund can be retried
+               await prisma.paymentOrder.updateMany({
+                    where: { id: paymentOrder.id, status: 'REFUND_INITIATED' },
+                    data: { status: previousStatus, version: { increment: 1 } },
+               });
+               throw err;
+          }
 
           // Create refund record
           const refund = await prisma.refund.create({
@@ -416,15 +425,6 @@ const initiateRefund = async (paymentOrderId, amount, reason, idempotencyKey) =>
                     status: 'INITIATED',
                     idempotencyKey,
                     gatewayRefundId: gatewayResult.gatewayRefundId,
-               },
-          });
-
-          // Update payment order status
-          await prisma.paymentOrder.update({
-               where: { id: paymentOrder.id },
-               data: {
-                    status: 'REFUND_INITIATED',
-                    version: { increment: 1 },
                },
           });
 

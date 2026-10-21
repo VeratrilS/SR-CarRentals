@@ -2,12 +2,15 @@ const config = {
      PORT: process.env.PORT || 4000,
      SERVICE_NAME: require('../../package.json').name,
      NODE_ENV: process.env.NODE_ENV || 'development',
+     LOG_LEVEL: process.env.LOG_LEVEL || 'info',
 
      REDIS_URL: process.env.REDIS_URL,
      ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || 'http://localhost:3000',
 
      JWT_ACCESS_SECRET: process.env.JWT_ACCESS_SECRET,
      JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET,
+     // Proves to downstream services that identity headers were set by the gateway
+     INTERNAL_SERVICE_KEY: process.env.INTERNAL_SERVICE_KEY,
      ACCESS_TOKEN_EXP: process.env.ACCESS_TOKEN_EXP,
      REFRESH_TOKEN_EXP: process.env.REFRESH_TOKEN_EXP,
      ACCESS_TOKEN_EXP_SEC: parseInt(process.env.ACCESS_TOKEN_EXP_SEC || '900', 10),
@@ -32,7 +35,7 @@ const config = {
      CIRCUIT_BREAKER_TIMEOUT: parseInt(process.env.CIRCUIT_BREAKER_TIMEOUT || '60000', 10),
 };
 
-const requiredConfig = ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET'];
+const requiredConfig = ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET', 'INTERNAL_SERVICE_KEY'];
 
 requiredConfig.forEach((key) => {
      if (!config[key]) {

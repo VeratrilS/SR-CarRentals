@@ -1,6 +1,6 @@
 const { ConflictError, BadRequestError, ForbiddenError, UnauthorizedError } = require("../utils/error")
 const {generateAndStoreOtp, verifyOtp} = require('../utils/otp');
-const {generateAccessToken, generateRefreshToken, verifyRefreshToken, roleFor} = require('../utils/auth');
+const {generateAccessToken, generateRefreshToken, verifyRefreshToken, roleFor, normalizeEmail} = require('../utils/auth');
 const notificationProducer = require('../kafka/producer/notification.producer')
 const bcrypt = require('bcrypt');
 const prisma = require('../config/prisma');
@@ -11,13 +11,34 @@ const jwt = require('jsonwebtoken');
 const {OAuth2Client} = require("google-auth-library");
 const client = new OAuth2Client(config.GOOGLE_CLIENT_ID);
 
-const sendOTP = async(firstName, lastName, email, password) =>{
+const isUniqueViolation = (err) => err?.code === 'P2002';
+const refreshKey = (userId, deviceId) => `refresh:${userId}:${deviceId}`;
+
+/**
+ * Every login method (password, Google) ends the same way: issue an access +
+ * refresh token pair, remember this device's refresh session (its jti) and
+ * cache the profile. New login methods only have to find the user.
+ */
+const issueSession = async(user, deviceId) =>{
+     const role = roleFor(user.email);
+     const accessToken = generateAccessToken(user.id, role);
+     const refreshToken = generateRefreshToken(user.id);
+     const {jti} = jwt.decode(refreshToken);
+     await redis.set(refreshKey(user.id, deviceId), jti, 'EX', config.REFRESH_TOKEN_EXP_SEC);
+     const {password: _password, ...rest} = user;
+     const safeUser = {...rest, role};
+     await redis.set(`user:${user.id}`, JSON.stringify(safeUser), 'EX', config.REDIS_USER_TTL);
+     return {accessToken, refreshToken, loggedInUser: safeUser};
+}
+
+const sendOTP = async(firstName, lastName, rawEmail, password) =>{
+     const email = normalizeEmail(rawEmail);
      const existingUser = await prisma.user.findUnique({
           where: {email}
      })
 
      if(existingUser){
-          throw new ConflictError("user already exists");
+          throw new ConflictError("An account with this email already exists", "ACCOUNT_EXISTS");
      }
      const hashedPassword = await bcrypt.hash(password, 12);
      const meta = {firstName, lastName, email, hashedPassword};
@@ -38,25 +59,34 @@ const verifyOTP = async(otp, otpSessionId) =>{
      if(meta === null){
           throw new BadRequestError("Invalid or expired OTP", "OTP_INVALID");
      }
-     const user = await prisma.user.create({
-          data: {
-               firstName: meta.firstName,
-               lastName: meta.lastName,
-               email: meta.email,
-               password: meta.hashedPassword,
-               emailVerified: true
+     let user;
+     try {
+          user = await prisma.user.create({
+               data: {
+                    firstName: meta.firstName,
+                    lastName: meta.lastName,
+                    email: meta.email,
+                    password: meta.hashedPassword,
+                    emailVerified: true
+               }
+          })
+     } catch (err) {
+          // Same email registered through another OTP session / Google meanwhile
+          if (isUniqueViolation(err)) {
+               throw new ConflictError("An account with this email already exists", "ACCOUNT_EXISTS");
           }
-     })
+          throw err;
+     }
 
      await notificationProducer.sendWelcomeEmail(meta.email, meta.firstName);
      logger.info(`Welcome email queued for ${meta.email}`);
-     return user;
-     
+     const {password: _password, ...safeUser} = user;
+     return safeUser;
 }
 
-const login = async(email, password, deviceId) =>{
+const login = async(rawEmail, password, deviceId) =>{
      const existingUser = await prisma.user.findUnique({
-          where: {email}
+          where: {email: normalizeEmail(rawEmail)}
      })
      if(!existingUser){
           throw new UnauthorizedError("Invalid email or password", "INVALID_CREDENTIALS");
@@ -71,37 +101,41 @@ const login = async(email, password, deviceId) =>{
      if(!doesPasswordMatch){
           throw new UnauthorizedError("Invalid email or password", "INVALID_CREDENTIALS");
      }
-     const role = roleFor(existingUser.email);
-     const accessToken = generateAccessToken(existingUser.id, role);
-     const refreshToken = generateRefreshToken(existingUser.id);
-     const {jti} = jwt.decode(refreshToken);
-     await redis.set(`refresh:${existingUser.id}:${deviceId}`, jti, 'EX', config.REFRESH_TOKEN_EXP_SEC);
-     const {password: _password, ...rest} = existingUser;
-     const safeUser = {...rest, role};
-     await redis.set(`user:${existingUser.id}`, JSON.stringify(safeUser), 'EX', config.REDIS_USER_TTL);
-     return {accessToken, refreshToken, loggedInUser: safeUser};
+     return issueSession(existingUser, deviceId);
 }
 
+// Compare-and-swap in one atomic step: only the holder of the *current* jti may
+// rotate it. Any other jti for this device is a replayed token → end the session.
+const ROTATE_JTI = `
+local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+if current ~= ARGV[1] then
+     redis.call('DEL', KEYS[1])
+     return -1
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1`;
 
 const rotateRefreshToken = async(refreshToken, deviceId) =>{
-     const payload = verifyRefreshToken(refreshToken);
-     const {id: userId, jti} = payload;
-     const storedJti = await redis.get(`refresh:${userId}:${deviceId}`);
-     if(!storedJti){
-          throw new ForbiddenError("Session Expired", "Login AGAIN")
-     }
-     if(storedJti !== jti){
-          await redis.del(`refresh:${userId}:${deviceId}`);
-          throw new ForbiddenError("Refresh token reused", "LOGIN AGAIN")
-     }
-     const user = await prisma.user.findUnique({ where: { id: payload.id }, select: { email: true } });
+     const {id: userId, jti} = verifyRefreshToken(refreshToken);
+     const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
      if(!user){
-          throw new ForbiddenError("User no longer exists", "LOGIN AGAIN")
+          await redis.del(refreshKey(userId, deviceId));
+          throw new ForbiddenError("User no longer exists", "LOGIN_AGAIN")
      }
-     const newAccessToken = generateAccessToken(payload.id, roleFor(user.email));
-     const newRefreshToken = generateRefreshToken(payload.id);
+
+     const newAccessToken = generateAccessToken(userId, roleFor(user.email));
+     const newRefreshToken = generateRefreshToken(userId);
      const {jti: newJti} = jwt.decode(newRefreshToken);
-     await redis.set(`refresh:${payload.id}:${deviceId}`, newJti, 'EX', config.REFRESH_TOKEN_EXP_SEC);
+
+     const result = await redis.eval(ROTATE_JTI, 1, refreshKey(userId, deviceId), jti, newJti, config.REFRESH_TOKEN_EXP_SEC);
+     if(result === 0){
+          throw new ForbiddenError("Session Expired", "LOGIN_AGAIN")
+     }
+     if(result === -1){
+          logger.warn(`Refresh token reuse detected for user ${userId} — session revoked`);
+          throw new ForbiddenError("Refresh token reused", "LOGIN_AGAIN")
+     }
      return {newAccessToken, newRefreshToken};
 }
 
@@ -113,89 +147,104 @@ const logout = async(refreshToken, deviceId) =>{
      if(!refreshToken) return;
      try {
           const {id: userId} = verifyRefreshToken(refreshToken);
-          await redis.del(`refresh:${userId}:${deviceId}`);
+          await redis.del(refreshKey(userId, deviceId));
           logger.info(`User ${userId} logged out`);
      } catch (err) {
-          logger.info('Logout with invalid or expired refresh token', { error: err.message });
+          logger.info(`Logout with invalid or expired refresh token: ${err.message}`);
      }
 }
 
-const verifyGoogleIdToken = async(idToken, deviceId) =>{
-     const ticket = await client.verifyIdToken({
-          idToken,
-          audience: config.GOOGLE_CLIENT_ID
+const findOrCreateGoogleUser = (googleUser) => prisma.$transaction(async (tx) =>{
+     const googleAuth = await tx.authProvider.findUnique({
+          where: {
+               provider_providerId: {
+                    provider: googleUser.provider,
+                    providerId: googleUser.providerId
+               }
+          },
+          include: {user: true}
      })
-     const payload = ticket.getPayload();
 
-     if(!payload.sub || !payload.email){
-          throw new UnauthorizedError("Invalid Google Token Payload")
+     if(googleAuth){
+          return googleAuth.user;
      }
 
-     const googleUser = {
-          provider: "google",
-          providerId: payload.sub,
-          email: payload.email,
-          firstName: payload.given_name,
-          lastName: payload.family_name,
-          emailVerified: payload.email_verified || false
+     const existingUser = await tx.user.findUnique({
+          where: {email: googleUser.email}
+     })
+
+     if(existingUser){
+          // Linking Google to an existing account is only safe if Google has
+          // verified that the caller really owns this address
+          if(!googleUser.emailVerified){
+               throw new ConflictError(
+                    "An account with this email already exists. Log in with your password.",
+                    "ACCOUNT_EXISTS"
+               );
+          }
+          await tx.authProvider.create({
+               data: {
+                    provider: googleUser.provider,
+                    providerId: googleUser.providerId,
+                    userId: existingUser.id
+               }
+          })
+          return existingUser;
      }
 
-
-     const user = await prisma.$transaction(async (tx) =>{
-          let googleAuth = await tx.authProvider.findUnique({
-               where: {
-                    provider_providerId: {
+     return tx.user.create({
+          data: {
+               email: googleUser.email,
+               firstName: googleUser.firstName,
+               lastName: googleUser.lastName,
+               emailVerified: googleUser.emailVerified,
+               AuthProviders: {
+                    create: {
                          provider: googleUser.provider,
                          providerId: googleUser.providerId
                     }
-               },
-               include: {user: true}
-          })
-
-          if(googleAuth){
-               return googleAuth.user;
-          }
-
-          let existingUser = await tx.user.findUnique({
-               where: {email: googleUser.email}
-          })
-
-          if(existingUser){
-               await tx.authProvider.create({
-                    data: {
-                         provider: googleUser.provider,
-                         providerId: googleUser.providerId,
-                         userId: existingUser.id
-                    }
-               })
-               return existingUser;
-          }
-
-          return await tx.user.create({
-               data: {
-                    email: googleUser.email,
-                    firstName: googleUser.firstName,
-                    lastName: googleUser.lastName,
-                    emailVerified: googleUser.emailVerified,
-                    AuthProviders: {
-                         create: {
-                              provider: googleUser.provider,
-                              providerId: googleUser.providerId
-                         }
-                    }
                }
-          })
+          }
      })
+})
 
-     const role = roleFor(user.email);
-     const accessToken = generateAccessToken(user.id, role);
-     const refreshToken = generateRefreshToken(user.id);
-     const {jti} = jwt.decode(refreshToken);
-     await redis.set(`refresh:${user.id}:${deviceId}`, jti, 'EX', config.REFRESH_TOKEN_EXP_SEC);
-     const {password: _password, ...rest} = user;
-     const safeUser = {...rest, role};
-     await redis.set(`user:${user.id}`, JSON.stringify(safeUser), 'EX', config.REDIS_USER_TTL);
-     return {accessToken, refreshToken, loggedInUser: safeUser};
-     
+const verifyGoogleIdToken = async(idToken, deviceId) =>{
+     let payload;
+     try {
+          const ticket = await client.verifyIdToken({
+               idToken,
+               audience: config.GOOGLE_CLIENT_ID
+          })
+          payload = ticket.getPayload();
+     } catch (err) {
+          logger.warn(`Google ID token rejected: ${err.message}`);
+          throw new UnauthorizedError("Google sign-in failed. Please try again.", "INVALID_GOOGLE_TOKEN");
+     }
+
+     if(!payload?.sub || !payload?.email){
+          throw new UnauthorizedError("Invalid Google Token Payload")
+     }
+
+     const email = normalizeEmail(payload.email);
+     const googleUser = {
+          provider: "google",
+          providerId: payload.sub,
+          email,
+          // Google accounts don't always have a given/family name
+          firstName: payload.given_name || payload.name || email.split('@')[0],
+          lastName: payload.family_name || '',
+          emailVerified: payload.email_verified === true
+     }
+
+     let user;
+     try {
+          user = await findOrCreateGoogleUser(googleUser);
+     } catch (err) {
+          // Two first-time sign-ins raced to create the same user: the other one won, use it
+          if (!isUniqueViolation(err)) throw err;
+          user = await findOrCreateGoogleUser(googleUser);
+     }
+
+     return issueSession(user, deviceId);
 }
 module.exports = {sendOTP, verifyOTP, login, rotateRefreshToken, verifyGoogleIdToken, logout}

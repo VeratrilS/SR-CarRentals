@@ -4,6 +4,7 @@ const { config } = require('../config');
 const { redis } = require('../config/redis');
 const { forceReleaseBookingLock } = require('./distributedLock');
 const { compensateAll } = require('../services/saga.service');
+const { UNPAID_STATUSES, transition } = require('../services/bookingState');
 const { userClient } = require('../services/userClient');
 const bookingProducer = require('../kafka/producer/booking.producer');
 
@@ -63,7 +64,7 @@ async function cleanExpiredBookings() {
      try {
           const expiredBookings = await prisma.booking.findMany({
                where: {
-                    status: { in: ['PENDING', 'CAR_HELD', 'PAYMENT_PENDING'] },
+                    status: { in: UNPAID_STATUSES },
                     lockExpiresAt: { lt: new Date() },
                },
           });
@@ -76,20 +77,13 @@ async function cleanExpiredBookings() {
                try {
                     // Atomically claim this booking via optimistic lock (CAS).
                     // If payment webhook or user cancel already changed the version, skip it.
-                    const claimed = await prisma.booking.updateMany({
-                         where: {
-                              id: booking.id,
-                              version: booking.version,
-                              status: { in: ['PENDING', 'CAR_HELD', 'PAYMENT_PENDING'] },
-                         },
-                         data: {
-                              status: 'EXPIRED',
-                              failureReason: 'booking_timeout',
-                              version: { increment: 1 },
-                         },
+                    const claimed = await transition(booking.id, 'EXPIRED', {
+                         from: UNPAID_STATUSES,
+                         version: booking.version,
+                         data: { failureReason: 'booking_timeout' },
                     });
 
-                    if (claimed.count === 0) {
+                    if (!claimed) {
                          logger.info(`Booking ${booking.id} already handled by another process, skipping expiry`);
                          continue;
                     }

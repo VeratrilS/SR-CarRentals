@@ -1,10 +1,19 @@
 const express = require('express');
 const { requireAuth, requireAdmin } = require('../middlewares/auth.middleware');
 const { createProxy, getCircuitBreakerStatus } = require('../services/proxy');
-const { ipRateLimit, endpointRateLimit, combinedRateLimit } = require('../middlewares/rateLimiting.middleware')
-const { config } = require('../config');
+const { endpointRateLimit, userRateLimit } = require('../middlewares/rateLimiting.middleware')
 
 const router = express.Router();
+
+// ===========================
+// Access policies — each is a middleware chain (Chain of Responsibility):
+// any link can stop the request with an error, otherwise it reaches the proxy
+// ===========================
+// Logged-in traffic is limited per USER, not per IP: booking-status polling alone can
+// send ~40 requests in 2 minutes, and many users can share one IP (campus / office NAT).
+// Anonymous endpoints below keep their per-IP endpoint limits.
+const authed = [requireAuth, userRateLimit()];
+const adminOnly = [requireAuth, requireAdmin, userRateLimit()];
 
 // ===========================
 // Service Proxy Routes
@@ -16,7 +25,7 @@ const router = express.Router();
  * Service Path: /auth/login
 **/
 
-const userServiceProxy = createProxy('userService', config.SERVICES.USER_SERVICE_URL);
+const userServiceProxy = createProxy('userService');
 
 // public routes
 router.post(
@@ -58,30 +67,26 @@ router.post(
 // private routes
 router.get(
      '/users/user/profile',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      userServiceProxy
 )
 
 router.put(
      '/users/user/profile',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      userServiceProxy
 )
 
 router.delete(
      '/users/user/profile',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      userServiceProxy
 )
 
 // ===========================
 // ADMIN SERVICE ROUTES (fleet management — ADMIN role only)
 // ===========================
-const adminServiceProxy = createProxy('adminService', config.SERVICES.ADMIN_SERVICE_URL);
-const adminOnly = [requireAuth, requireAdmin, combinedRateLimit()];
+const adminServiceProxy = createProxy('adminService');
 
 router.post('/admins/branches/branch', ...adminOnly, adminServiceProxy);
 router.get('/admins/branches/branch', ...adminOnly, adminServiceProxy);
@@ -103,7 +108,7 @@ router.patch('/admins/rides/trip/:tripId/cancel', ...adminOnly, adminServiceProx
 // ===========================
 // SEARCH SERVICE ROUTES (public - no auth required)
 // ===========================
-const searchServiceProxy = createProxy('searchService', config.SERVICES.SEARCH_SERVICE_URL);
+const searchServiceProxy = createProxy('searchService');
 
 router.get(
      '/search/cars',
@@ -132,7 +137,7 @@ router.get(
 // ===========================
 // INVENTORY SERVICE ROUTES (public read-only)
 // ===========================
-const inventoryServiceProxy = createProxy('inventoryService', config.SERVICES.INVENTORY_SERVICE_URL);
+const inventoryServiceProxy = createProxy('inventoryService');
 
 // Public: a car's booked periods + whether a requested window is free
 router.get(
@@ -154,21 +159,19 @@ router.get(
 // ===========================
 // BOOKING SERVICE ROUTES
 // ===========================
-const bookingServiceProxy = createProxy('bookingService', config.SERVICES.BOOKING_SERVICE_URL);
+const bookingServiceProxy = createProxy('bookingService');
 
 // Price quote for a car + window (no side effects)
 router.get(
      '/bookings/bookings/quote',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      bookingServiceProxy
 );
 
 // Price quote for seats on a shared ride
 router.get(
      '/bookings/bookings/seat-quote',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      bookingServiceProxy
 );
 
@@ -181,36 +184,32 @@ router.post(
 
 router.get(
      '/bookings/bookings',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      bookingServiceProxy
 );
 
 router.get(
      '/bookings/bookings/:bookingId',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      bookingServiceProxy
 );
 
 router.post(
      '/bookings/bookings/:bookingId/verify-payment',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      bookingServiceProxy
 );
 
 router.post(
      '/bookings/bookings/:bookingId/cancel',
-     requireAuth,
-     combinedRateLimit(),
+     ...authed,
      bookingServiceProxy
 );
 
 // ===========================
 // PAYMENT SERVICE ROUTES (webhook only - public)
 // ===========================
-const paymentServiceProxy = createProxy('paymentService', config.SERVICES.PAYMENT_SERVICE_URL);
+const paymentServiceProxy = createProxy('paymentService');
 
 // Razorpay webhook (public — no auth, signature-verified by payment-service)
 router.post(

@@ -5,6 +5,7 @@ const cookieParser = require('cookie-parser');
 const morgan = require('morgan');
 const { config } = require('./config');
 const logger = require('./config/logger');
+const { RedisClient } = require('./config/redis');
 const errorHandler = require('./middlewares/error.middleware');
 const { notFound } = require('./middlewares/notFound.middleware');
 const { reqLogger } = require('./middlewares/req.middleware');
@@ -52,8 +53,9 @@ app.use(errorHandler);
 
 const gracefulShutdown = () => {
      logger.info('Received shutdown signal, closing server gracefully...');
-     server.close(() => {
+     server.close(async () => {
           logger.info('Server closed');
+          await RedisClient.closeConnection();
           process.exit(0);
      });
 

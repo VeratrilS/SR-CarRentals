@@ -322,11 +322,18 @@ const confirmCar = async (carId, bookingId, userId) => {
      return result;
 };
 
+/**
+ * Idempotent: booking-service retries this call on network errors. If an earlier
+ * attempt already deleted the hold (but its response was lost), a 404 here would make
+ * booking-service roll the cancellation back to CONFIRMED while the car is actually
+ * free — so "already gone" is a success, not an error.
+ */
 const cancelBooking = async (carId, bookingId) => {
      const deleted = await prisma.rentalHold.deleteMany({ where: { carId, bookingId } });
 
      if (deleted.count === 0) {
-          throw new NotFoundError('No reservation found for this booking');
+          logger.info(`No reservation left for booking ${bookingId} (already released)`);
+          return { carId, bookingId, released: false };
      }
 
      await publishAvailability(carId);

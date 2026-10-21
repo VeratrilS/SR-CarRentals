@@ -5,6 +5,7 @@ const authService = require('../services/auth.service');
 const getDeviceFingerprint = require("../utils/deviceFingerprint");
 
 const isProd = process.env.NODE_ENV === 'production';
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const cookieOptions = (maxAge) => ({
      httpOnly: true,
@@ -17,6 +18,15 @@ exports.sendOTP = asyncHandler(async(req, res) =>{
      const {firstName, lastName, email, password, confirmPassword} = req.body;
      if(!firstName || !lastName || !email || !password || !confirmPassword){
           throw new BadRequestError("All fields are mandatory");
+     }
+
+     if(!EMAIL_RE.test(String(email).trim())){
+          throw new BadRequestError("Enter a valid email address", "INVALID_EMAIL");
+     }
+
+     if(typeof password !== 'string' || password.length < 8 || password.length > 72){
+          // bcrypt only uses the first 72 bytes
+          throw new BadRequestError("Password must be 8-72 characters", "WEAK_PASSWORD");
      }
 
      if(password !== confirmPassword){
@@ -39,7 +49,7 @@ exports.verifyOTP = asyncHandler(async(req, res) =>{
      }
 
      const user = await authService.verifyOTP(otp, otpSessionId);
-     res.clearCookie("otp_session");
+     res.clearCookie("otp_session", { httpOnly: true, secure: isProd, sameSite: isProd ? 'strict' : 'lax' });
      return res.status(201).json({
           success: true,
           message: "User Account created successfully",
